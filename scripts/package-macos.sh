@@ -21,12 +21,13 @@ iconutil -c icns "$iconset" -o "$app/Contents/Resources/rameau.icns"
 # users approve the app once in System Settings › Privacy & Security.
 codesign --force --deep --sign - "$app"
 
-# Disk image with a shortcut to /Applications for drag-and-drop install.
-stage="$(mktemp -d)"
-cp -R "$app" "$stage/"
-ln -s /Applications "$stage/Applications"
-# Explicit size: hdiutil's own estimate is sometimes too small on CI runners ("No space left").
-size_mb=$(( $(du -sm "$stage" | cut -f1) + 50 ))
-hdiutil create -volname Rameau -srcfolder "$stage" -fs HFS+ -size "${size_mb}m" -ov -format UDZO \
-  "$out/rameau-$version-macos-universal.dmg" >/dev/null
-echo "$out/rameau-$version-macos-universal.dmg"
+# Disk image: the app, a shortcut to /Applications and the "drag here" background
+# (layout in packaging/macos/dmg-settings.py). dmgbuild writes the window layout itself,
+# without driving the Finder, so it works on CI machines too.
+venv="$(mktemp -d)/venv"
+python3 -m venv "$venv"
+"$venv/bin/pip" install --quiet --disable-pip-version-check dmgbuild==1.6.5
+dmg="$out/rameau-$version-macos-universal.dmg"
+"$venv/bin/dmgbuild" -s packaging/macos/dmg-settings.py -D app="$app" Rameau "$dmg" 2>&1 | grep -v deprecated || true
+test -s "$dmg"
+echo "$dmg"

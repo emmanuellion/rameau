@@ -3,8 +3,8 @@
 use git2::RepositoryState;
 use gpui::{
     Animation, AnimationExt, MouseMoveEvent, ease_out_quint, percentage, radians,
-    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, ExternalPaths, Hsla, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, PathBuilder, Pixels, Point, Render, ScrollStrategy, SharedString, Styled, WeakEntity,
+    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Corner, ExternalPaths, img, Hsla, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, PathBuilder, Pixels, Point, Render, SharedString, Styled, WeakEntity,
     Window, canvas, div, point, prelude::*, px, quad, relative, size, uniform_list,
 };
 use gpui_component::{
@@ -14,9 +14,9 @@ use gpui_component::{
     menu::{ContextMenu, ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
 };
 
-use crate::app::{CloseDiff, GitJob, Login, MenuTarget, Page, Project, Rameau, SelectNext, SelectPrev, Selection, Side};
+use crate::app::{CloseDiff, GitJob, Login, MenuTarget, Page, Project, Rameau, SelectNext, SelectPrev, Selection, Side, View};
 use crate::graph::{Half, Row};
-use crate::repo::{Changes, DiffSource, RefKind, RefLabel};
+use crate::repo::{Check, DiffSource, FileEntry, RefKind, RefLabel};
 use crate::theme::{alpha, c, lane_color, mono, pal, status_color};
 use crate::ui::{appear, avatar, button, button_sm, icon, icon_button, key};
 
@@ -33,20 +33,6 @@ const DATE_W: f32 = 110.;
 const HASH_W: f32 = 64.;
 /// Height of every line of the file lists (headers included): they are virtualized.
 const LIST_ROW_H: f32 = 34.;
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum FileGroup {
-    Conflicts,
-    Unstaged,
-    Staged,
-}
-
-/// A line of the changes list: group header (with its file count) or a file of a group.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum ChangeItem {
-    Header(FileGroup, usize),
-    File(FileGroup, usize),
-}
 
 /// Height of every sidebar line (headers included): the list is virtualized.
 const SIDE_ROW_H: f32 = 32.;
@@ -153,26 +139,23 @@ impl Rameau {
             .dropdown_menu(move |menu, _, cx| Self::projects_menu(&weak, menu, cx));
         let bar = div().flex().items_center().gap_1().w_full().pr_3().child(switcher);
         let Some(pr) = self.proj.as_ref().filter(|_| self.page == Page::Repo) else {
-            return TitleBar::new().h(px(TITLE_BAR_H)).child(bar);
+            return TitleBar::new().h(px(TITLE_BAR_H)).child(bar.child(div().flex_1()).child(self.account_button(cx)));
         };
         let h = &pr.history;
         let busy = self.busy.is_some();
         let (ahead, behind) = h.ahead_behind.unwrap_or((0, 0));
         let push_primary = h.has_commits && (ahead > 0 || h.ahead_behind.is_none());
+        let weak = cx.weak_entity();
+        let branch = button("branch")
+            .ghost()
+            .icon(icon("git-branch"))
+            .label(h.head.clone())
+            .child(Icon::new(IconName::ChevronDown).xsmall().text_color(c(p.faint)))
+            .tooltip("Changer de branche")
+            .dropdown_menu(move |menu, _, cx| Self::branches_menu(&weak, menu, cx));
         TitleBar::new().h(px(TITLE_BAR_H)).child(
-            bar.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .h(px(28.))
-                    .px_2p5()
-                    .rounded(px(7.))
-                    .bg(c(p.hover))
-                    .text_sm()
-                    .child(icon("git-branch").xsmall().text_color(c(p.accent)))
-                    .child(h.head.clone()),
-            )
+            bar.child(branch)
+            .children(self.pull_request_button(pr))
             .when(h.has_commits && h.head_branch.is_some() && h.ahead_behind.is_none(), |d| {
                 d.child(div().pl_1().text_xs().text_color(c(p.faint)).child("pas encore publiée"))
             })
@@ -235,8 +218,159 @@ impl Rameau {
                     .when(!push_primary, |b| b.ghost())
                     .disabled(busy || h.head_branch.is_none() || !h.has_commits)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.push(window, cx))),
-            ),
+            )
+            .child(div().w(px(6.)))
+            .child(self.account_button(cx)),
         )
+    }
+
+    /// Author's GitHub picture when known, else their initials.
+    fn author_avatar(&self, email: &str, name: &str, size: f32) -> AnyElement {
+        match self.avatar_of(email) {
+            Some(image) => img(image).size(px(size)).flex_none().rounded_full().into_any_element(),
+            None => avatar(name, size).into_any_element(),
+        }
+    }
+
+    /// CI result of a branch on GitHub: ✓, ✗ or a dot while it runs.
+    fn ci_icon(&self, branch: &str) -> Option<AnyElement> {
+        let p = pal();
+        let checks = *self.gh_info.as_ref()?.checks.get(branch)?;
+        Some(match checks {
+            crate::github::Checks::Success => Icon::new(IconName::Check).xsmall().text_color(c(p.green)).into_any_element(),
+            crate::github::Checks::Failure => Icon::new(IconName::Close).xsmall().text_color(c(p.red)).into_any_element(),
+            crate::github::Checks::Pending => div().size(px(7.)).mx(px(2.5)).rounded_full().bg(c(p.yellow)).into_any_element(),
+        })
+    }
+
+    /// Next to the current branch: its pull request, or a button to open one once the branch is pushed.
+    fn pull_request_button(&self, pr: &Project) -> Option<AnyElement> {
+        let info = self.gh_info.as_ref()?;
+        let branch = pr.history.head_branch.clone()?;
+        if let Some(pull) = self.pull_request(&branch) {
+            let url = pull.url.clone();
+            let label = if pull.draft { format!("PR #{} (brouillon)", pull.number) } else { format!("PR #{}", pull.number) };
+            return Some(
+                button_sm("open-pr")
+                    .ghost()
+                    .icon(IconName::GitHub)
+                    .label(label)
+                    .children(self.ci_icon(&branch))
+                    .tooltip(pull.title.clone())
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .into_any_element(),
+            );
+        }
+        if pr.history.ahead_behind.is_none() || branch == info.default_branch {
+            return self.ci_icon(&branch);
+        }
+        let url = format!("https://github.com/{}/compare/{branch}?expand=1", info.slug);
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .children(self.ci_icon(&branch))
+                .child(
+                    button_sm("create-pr")
+                        .ghost()
+                        .icon(IconName::GitHub)
+                        .label("Créer une pull request")
+                        .tooltip("Ouvre la page GitHub de création, pré-remplie avec cette branche")
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// GitHub account at the right of the title bar: its picture and a menu (identity, theme,
+    /// sign-out); a sign-in button when signed out, the code to type while signing in.
+    fn account_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = pal();
+        let weak = cx.weak_entity();
+        let menu = move |menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>| Self::account_menu(&weak, menu, cx);
+        match &self.login {
+            Login::Waiting(code) => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .pl_3()
+                .pr_1()
+                .h(px(30.))
+                .rounded(px(8.))
+                .bg(alpha(p.accent, 0.12))
+                .child(div().text_xs().text_color(c(p.muted)).child("Code GitHub (copié) :"))
+                .child(div().text_sm().font_family(mono()).font_weight(gpui::FontWeight::SEMIBOLD).text_color(c(p.text)).child(code.clone()))
+                .child(button_sm("cancel-login").ghost().label("Annuler").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.logout(cx))))
+                .into_any_element(),
+            Login::Out => button("account")
+                .ghost()
+                .icon(IconName::GitHub)
+                .label("Se connecter")
+                .dropdown_menu_with_anchor(Corner::TopRight, menu)
+                .into_any_element(),
+            Login::In(a) => {
+                let pic = match &self.avatar {
+                    Some(image) => img(image.clone()).size(px(26.)).rounded_full().into_any_element(),
+                    None => avatar(&a.login, 26.).into_any_element(),
+                };
+                button("account")
+                    .ghost()
+                    .px_1p5()
+                    .child(pic)
+                    .child(Icon::new(IconName::ChevronDown).xsmall().text_color(c(p.faint)))
+                    .dropdown_menu_with_anchor(Corner::TopRight, menu)
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn account_menu(weak: &WeakEntity<Self>, mut menu: PopupMenu, cx: &mut App) -> PopupMenu {
+        let Some(this) = weak.upgrade() else { return menu };
+        let this = this.read(cx);
+        let act = |label: &str, f: fn(&mut Rameau, &mut Window, &mut Context<Rameau>)| {
+            let weak = weak.clone();
+            PopupMenuItem::new(label.to_owned()).on_click(move |_, window, cx| {
+                weak.update(cx, |this, cx| f(this, window, cx)).ok();
+            })
+        };
+        if let Login::In(a) = &this.login {
+            let who = match &a.name {
+                Some(name) => format!("{name} ({})", a.login),
+                None => a.login.clone(),
+            };
+            menu = menu.label(who).separator();
+        }
+        let theme = if this.config.light { "Thème sombre" } else { "Thème clair" };
+        menu = menu
+            .item(act("Identité git (nom, e-mail)…", |this, window, cx| this.identity_dialog(false, window, cx)).icon(IconName::User))
+            .item(act(theme, |this, window, cx| this.toggle_theme(window, cx)).icon(if this.config.light { IconName::Moon } else { IconName::Sun }))
+            .separator();
+        match this.login {
+            Login::In(_) => menu.item(act("Se déconnecter de GitHub", |this, _, cx| this.logout(cx))),
+            _ => menu.item(act("Se connecter avec GitHub…", |this, window, cx| this.login(window, cx)).icon(IconName::GitHub)),
+        }
+    }
+
+    /// Local branches to switch to, and a new branch from the current commit.
+    fn branches_menu(weak: &WeakEntity<Self>, mut menu: PopupMenu, cx: &mut App) -> PopupMenu {
+        let Some(this) = weak.upgrade() else { return menu };
+        let this = this.read(cx);
+        let Some(pr) = &this.proj else { return menu };
+        for b in pr.history.branches.iter().filter(|b| b.kind != RefKind::Remote) {
+            let (weak, name) = (weak.clone(), b.name.clone());
+            menu = menu.item(PopupMenuItem::new(b.name.clone()).checked(b.kind == RefKind::Head).on_click(move |_, window, cx| {
+                let job = GitJob::owned("Checkout", vec!["switch".into(), name.clone()]);
+                weak.update(cx, |this, cx| this.run(job, window, cx)).ok();
+            }));
+        }
+        let head = pr.repo.head().ok().and_then(|h| h.target());
+        let weak = weak.clone();
+        menu.separator().item(PopupMenuItem::new("Nouvelle branche…").icon(IconName::Plus).disabled(head.is_none()).on_click(move |_, window, cx| {
+            if let Some(at) = head {
+                weak.update(cx, |this, cx| this.new_branch_dialog(at, window, cx)).ok();
+            }
+        }))
     }
 
     fn projects_menu(weak: &WeakEntity<Self>, mut menu: PopupMenu, cx: &mut App) -> PopupMenu {
@@ -349,11 +483,15 @@ impl Rameau {
             }
             SideItem::Branch(i) => {
                 let b = &h.branches[i];
-                let color = b.row.map_or(c(p.faint), |r| lane_color(h.rows[r].color));
+                // Rows not read yet have no lane: their branch takes its name's color meanwhile.
+                let color = match b.row.and_then(|r| h.rows.get(r)) {
+                    Some(r) => lane_color(r.color),
+                    None => lane_color(crate::graph::color_index(b.name.rsplit('/').next().unwrap_or(&b.name).as_bytes())),
+                };
                 let row = b.row;
                 let is_head = b.kind == RefKind::Head;
                 let target = MenuTarget::Branch(b.name.clone(), b.kind);
-                let selected = row.is_some_and(|r| Some(h.commits[r].id) == selected_id);
+                let selected = row.is_some_and(|r| Some(h.order[r]) == selected_id);
                 // "origin/feature/x": the remote name fades, the branch stands out.
                 let (prefix, name) = match b.kind {
                     RefKind::Remote => b.name.split_once('/').map_or(("", b.name.as_str()), |(r, n)| (r, n)),
@@ -378,13 +516,14 @@ impl Rameau {
                                         .child(name.to_owned()),
                                 ),
                         )
+                        .when(b.kind != RefKind::Remote, |d| {
+                            d.children(self.ci_icon(&b.name)).children(self.pull_request(&b.name).map(|pr| pr_pill(("pr", i), pr)))
+                        })
                         .when(is_head, |d| d.child(Icon::new(IconName::Check).xsmall().text_color(c(p.accent))))
                         .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_target = Some(target.clone())))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(r) = row {
-                                this.scroll.scroll_to_item(r, ScrollStrategy::Center);
-                                let id = this.proj.as_ref().unwrap().history.commits[r].id;
-                                this.select_commit(id, cx);
+                                this.reveal_row(r, cx);
                             }
                         })),
                 )
@@ -398,11 +537,43 @@ impl Rameau {
                         .child(div().flex_none().text_xs().font_family(mono()).text_color(c(p.faint)).child(format!("{{{index}}}")))
                         .child(div().flex_1().truncate().text_sm().text_color(c(p.muted)).child(st.message.clone()))
                         .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_target = Some(MenuTarget::Stash(index))))
-                        .on_click(cx.listener(move |this, _, _, cx| this.select_commit(id, cx))),
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.view = View::History;
+                            this.select_commit(id, cx)
+                        })),
                 )
                 .into_any_element()
             }
         }
+    }
+
+    /// Entry at the top of the sidebar switching the main area.
+    fn nav_item(&self, view: View, ico: Icon, title: &'static str, count: Option<usize>, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = pal();
+        let active = self.view == view;
+        div()
+            .id(title)
+            .mx_2()
+            .px_2p5()
+            .h(px(34.))
+            .flex()
+            .items_center()
+            .gap_2p5()
+            .rounded(px(8.))
+            .cursor_pointer()
+            .when(active, |d| d.bg(c(p.selected)))
+            .when(!active, |d| d.hover(|s| s.bg(c(p.hover))))
+            .child(ico.small().text_color(c(if active { p.accent } else { p.muted })))
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .text_color(c(if active { p.text } else { p.muted }))
+                    .when(active, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
+                    .child(title),
+            )
+            .children(count.filter(|n| *n > 0).map(|n| badge(n, false)))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_view(view, cx)))
     }
 
     fn sidebar(&self, pr: &Project, cx: &mut Context<Self>) -> impl IntoElement {
@@ -420,6 +591,7 @@ impl Rameau {
         )
         .flex_1()
         .pb_4();
+        let changed = pr.history.changes.files.len();
         div()
             .id("sidebar")
             .w(px(self.sidebar_w()))
@@ -429,75 +601,30 @@ impl Rameau {
             .bg(c(p.panel))
             .border_r_1()
             .border_color(c(p.border))
+            .child(
+                div()
+                    .flex_none()
+                    .pt_3()
+                    .pb_2()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .border_b_1()
+                    .border_color(c(p.border))
+                    .child(self.nav_item(View::Changes, icon("square-pen"), "Modifications", Some(changed), cx))
+                    .child(self.nav_item(View::History, icon("history"), "Historique", None, cx)),
+            )
             .child(self.with_menu(
                 div()
                     .id("branches")
                     .flex_1()
                     .min_h_0()
+                    .pt_1()
                     .flex()
                     .flex_col()
                     .child(list),
                 cx,
             ))
-            .child(self.account(cx))
-    }
-
-
-    fn account(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = pal();
-        let theme_button = icon_button("theme", if self.config.light { IconName::Moon } else { IconName::Sun })
-            .tooltip(if self.config.light { "Thème sombre" } else { "Thème clair" })
-            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_theme(window, cx)));
-        let body = match &self.login {
-            Login::Out => div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    button("login")
-                        .outline()
-                        .icon(IconName::GitHub)
-                        .label("Connexion GitHub")
-                        .flex_1()
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.login(window, cx))),
-                )
-                .child(theme_button)
-                .into_any_element(),
-            Login::Waiting(code) => div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(div().text_xs().text_color(c(p.muted)).child("Code copié, colle-le sur la page GitHub :"))
-                .child(div().text_xl().font_family(mono()).text_color(c(p.text)).child(code.clone()))
-                .child(button_sm("cancel-login").ghost().label("Annuler").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.logout(cx))))
-                .into_any_element(),
-            Login::In(a) => div()
-                .flex()
-                .items_center()
-                .gap_2p5()
-                .child(avatar(&a.login, 28.))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(div().truncate().text_sm().text_color(c(p.text)).child(a.login.clone()))
-                        .child(
-                            div()
-                                .id("logout")
-                                .text_xs()
-                                .text_color(c(p.faint))
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(c(p.accent)))
-                                .child("Se déconnecter")
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.logout(cx))),
-                        ),
-                )
-                .child(theme_button)
-                .into_any_element(),
-        };
-        div().p_3().border_t_1().border_color(c(p.border)).child(body)
     }
 
     /// Banner shown while a merge/rebase/cherry-pick waits for the user.
@@ -571,7 +698,6 @@ impl Rameau {
                 div().px_2().h(px(20.)).flex().items_center().rounded_full().text_xs().bg(alpha(color, 0.14)).text_color(c(color)).child(format!("{n} {word}{plural}"))
             })
         };
-        let selected = self.selection == Selection::Changes;
         Some(
             div()
                 .id("wip")
@@ -582,10 +708,9 @@ impl Rameau {
                 .pr_4()
                 .cursor_pointer()
                 .border_l_2()
-                .border_color(if selected { c(p.accent) } else { gpui::transparent_black().into() })
-                .when(selected, |d| d.bg(c(p.selected)))
-                .when(!selected, |d| d.hover(|s| s.bg(c(p.hover))))
-                .on_click(cx.listener(|this, _, _, cx| this.select_changes(cx)))
+                .border_color(gpui::transparent_black())
+                .hover(|s| s.bg(c(p.hover)))
+                .on_click(cx.listener(|this, _, _, cx| this.set_view(View::Changes, cx)))
                 .child(
                     div()
                         .w(px(Self::graph_width(pr)))
@@ -614,7 +739,7 @@ impl Rameau {
         let row = pr.history.rows[ix].clone();
         let color = lane_color(row.color);
         let selected = self.selection == Selection::Commit(id);
-        let is_merge = row.segments.iter().filter(|s| s.half == Half::Bottom && s.from == row.lane).count() > 1;
+        let is_merge = row.segments.iter().filter(|s| s.half == Half::Bottom && s.from as usize == row.lane).count() > 1;
         div()
             .id(ix)
             .h(px(ROW_H))
@@ -661,7 +786,7 @@ impl Rameau {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(avatar(&cm.author, 20.))
+                    .child(self.author_avatar(&cm.email, &cm.author, 20.))
                     .when(cols.author_name, |d| d.child(div().min_w_0().truncate().text_xs().text_color(c(p.muted)).child(cm.author.clone()))),
             )
             .when(cols.date, |d| {
@@ -672,11 +797,113 @@ impl Rameau {
             })
     }
 
-    fn commit_list(&self, pr: &Project, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// A commit found by the history search.
+    fn found_row(&self, i: usize, f: &crate::repo::Found, cx: &mut Context<Self>) -> AnyElement {
+        let p = pal();
+        let cols = Columns::for_width(self.center_w);
+        let id = f.id;
+        let selected = self.selection == Selection::Commit(id);
+        div()
+            .id(("found", i))
+            .h(px(ROW_H))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_3()
+            .pl_4()
+            .pr_4()
+            .cursor_pointer()
+            .border_l_2()
+            .border_color(if selected { c(p.accent) } else { gpui::transparent_black().into() })
+            .when(selected, |d| d.bg(c(p.selected)))
+            .when(!selected, |d| d.hover(|s| s.bg(c(p.hover))))
+            .on_click(cx.listener(move |this, _, _, cx| this.select_commit(id, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.menu_target = Some(MenuTarget::Commit(id));
+                    this.select_commit(id, cx);
+                }),
+            )
+            .child(div().size(px(8.)).flex_none().rounded_full().bg(c(p.accent)))
+            .child(div().flex_1().min_w_0().truncate().text_sm().text_color(c(p.text)).child(f.summary.clone()))
+            .child(
+                div()
+                    .w(px(cols.author_w()))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(self.author_avatar(&f.email, &f.author, 20.))
+                    .when(cols.author_name, |d| d.child(div().min_w_0().truncate().text_xs().text_color(c(p.muted)).child(f.author.clone()))),
+            )
+            .when(cols.date, |d| d.child(div().w(px(DATE_W)).flex_none().truncate().text_xs().text_color(c(p.muted)).child(crate::repo::relative_time(f.time))))
+            .when(cols.hash, |d| d.child(div().w(px(HASH_W)).flex_none().text_xs().font_family(mono()).text_color(c(p.faint)).child(id.to_string()[..7].to_owned())))
+            .into_any_element()
+    }
+
+    fn commit_list(&self, pr: &Project, cx: &mut Context<Self>) -> AnyElement {
         let p = pal();
         let cols = Columns::for_width(self.center_w);
         let col = |text: &'static str| div().text_xs().font_weight(gpui::FontWeight::MEDIUM).text_color(c(p.faint)).child(text);
-        self.with_menu(
+        let search = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(c(p.border))
+            .child(div().flex_1().max_w(px(520.)).child(if self.search_open || self.search_hits.is_some() {
+                Input::new(&self.history_search)
+                    .cleanable(true)
+                    .prefix(Icon::new(IconName::Search).small().text_color(c(p.faint)))
+                    .into_any_element()
+            } else {
+                // Looks like the field, opens it on click.
+                div()
+                    .id("search-closed")
+                    .h(px(32.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(c(p.border))
+                    .cursor_text()
+                    .text_sm()
+                    .text_color(c(p.faint))
+                    .hover(|s| s.border_color(c(p.muted)))
+                    .child(Icon::new(IconName::Search).small().text_color(c(p.faint)))
+                    .child("Rechercher un commit : message, auteur ou hash")
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_search(window, cx)))
+                    .into_any_element()
+            }))
+            .children(self.search_hits.as_ref().map(|(_, hits)| {
+                let n = hits.len();
+                div().text_xs().text_color(c(p.muted)).child(match n {
+                    0 => "Aucun commit trouvé".to_owned(),
+                    1 => "1 commit trouvé".to_owned(),
+                    n => format!("{n} commits trouvés"),
+                })
+            }));
+        // Searching: the commits found, newest first, without the graph (their lanes would be cut).
+        if let Some((_, hits)) = &self.search_hits {
+            let list = uniform_list(
+                "found",
+                hits.len(),
+                cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                    let Some((index, hits)) = &this.search_hits else { return vec![] };
+                    range.filter_map(|i| hits.get(i).map(|&h| this.found_row(i, &index[h], cx))).collect::<Vec<_>>()
+                }),
+            )
+            .flex_1();
+            let found = self.with_menu(div().flex_1().min_h_0().flex().flex_col().child(list), cx);
+            return div().flex_1().min_h_0().flex().flex_col().child(search).child(found).into_any_element();
+        }
+        let graph = self.with_menu(
             div()
             .flex_1()
             .min_h_0()
@@ -702,8 +929,17 @@ impl Rameau {
                 uniform_list(
                     "commits",
                     pr.history.commits.len(),
-                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                    cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
                         let Some(pr) = &this.proj else { return vec![] };
+                        // Near the last commit read: read the next page, shown at the next frame.
+                        if pr.history.has_more() && range.end + 30 >= pr.history.commits.len() {
+                            let upto = pr.history.commits.len() + crate::repo::PAGE;
+                            cx.defer_in(window, move |this, _, cx| {
+                                this.load_commits(upto);
+                                this.want_avatars(cx);
+                                cx.notify();
+                            });
+                        }
                         range.map(|ix| this.commit_row(pr, ix, cx)).collect::<Vec<_>>()
                     }),
                 )
@@ -712,209 +948,243 @@ impl Rameau {
             ),
             cx,
         )
+        ;
+        div().flex_1().min_h_0().flex().flex_col().child(search).child(graph).into_any_element()
     }
 
-    fn file_row(
-        &self,
-        id: (&'static str, usize),
-        (status, path): &(char, String),
-        source: DiffSource,
-        toggle: Option<(bool, Vec<String>)>,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let p = pal();
+    /// File of a commit, in the details panel.
+    fn file_row(&self, id: (&'static str, usize), (status, path): &(char, String), source: DiffSource, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let open = self.diff.as_ref().is_some_and(|d| d.path == *path && d.source == source);
-        let (dir, name) = path.rsplit_once('/').map_or(("", path.as_str()), |(d, n)| (d, n));
         let pth = path.clone();
-        div()
-            .id(id)
-            .h(px(30.))
-            .flex()
-            .items_center()
-            .gap_2p5()
-            .px_2()
-            .rounded(px(7.))
-            .cursor_pointer()
-            .when(open, |d| d.bg(c(p.selected)))
-            .when(!open, |d| d.hover(|s| s.bg(c(p.hover))))
-            .when_some(toggle, |row, (checked, args)| {
-                row.child(
-                    div()
-                        .id("check")
-                        .size(px(16.))
-                        .flex_none()
-                        .rounded(px(5.))
-                        .border_1()
-                        .border_color(c(if checked { p.accent } else { p.faint }))
-                        .when(checked, |d| d.bg(c(p.accent)))
-                        .hover(|s| s.border_color(c(p.accent)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(checked, |d| {
-                            d.child(Icon::new(IconName::Check).text_color(c(p.bg)).with_animation(
-                                "pop",
-                                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
-                                |icon, t| icon.size(px(6. + 6. * t)),
-                            ))
-                        })
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.run(GitJob::owned(if checked { "Retrait" } else { "Ajout" }, args.clone()).status_only(), window, cx);
-                        })),
-                )
-            })
-            .child(
-                div()
-                    .size(px(18.))
-                    .flex_none()
-                    .rounded(px(4.))
-                    .bg(gpui::Rgba { a: 0.14, ..status_color(*status) })
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(status_color(*status))
-                    .child(status.to_string()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .gap_1p5()
-                    .text_sm()
-                    .child(div().flex_none().text_color(c(p.text)).child(name.to_owned()))
-                    .child(div().min_w_0().truncate().text_xs().pt_0p5().text_color(c(p.faint)).child(dir.to_owned())),
-            )
+        file_line(id, None, *status, path, open)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_diff(source.clone(), pth.clone(), false, cx)))
     }
 
-    /// Lines of the changes list: a header per non-empty group, then its files.
-    fn change_items(ch: &Changes) -> Vec<ChangeItem> {
-        let mut items = Vec::new();
-        for (group, len) in [(FileGroup::Conflicts, ch.conflicted.len()), (FileGroup::Unstaged, ch.unstaged.len()), (FileGroup::Staged, ch.staged.len())] {
-            if len > 0 {
-                items.push(ChangeItem::Header(group, len));
-                items.extend((0..len).map(|i| ChangeItem::File(group, i)));
-            }
-        }
-        items
+    /// Changed file of the working copy: its box says how much of it goes into the commit.
+    fn change_row(&self, ix: usize, f: &FileEntry, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.diff.as_ref().is_some_and(|d| d.path == f.path && !matches!(d.source, DiffSource::Commit(_)));
+        // Checked whole: take it out of the commit. Otherwise (or a conflict marked solved): put it all in.
+        let args: Vec<String> = match f.check {
+            Check::All => vec!["reset".into(), "-q".into(), "--".into(), crate::git::literal(&f.path)],
+            _ => vec!["add".into(), "--".into(), crate::git::literal(&f.path)],
+        };
+        let what = if f.check == Check::All { "Retrait" } else { "Ajout" };
+        let (source, path) = (f.diff_source(), f.path.clone());
+        let target = MenuTarget::File(f.path.clone(), f.status == 'A' && f.check == Check::None);
+        div()
+            .w_full()
+            .h(px(LIST_ROW_H))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .child(
+                file_line(
+                    ("change", ix),
+                    Some(check_box(("check", ix), f.check).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.run(GitJob::owned(what, args.clone()).status_only(), window, cx);
+                    }))),
+                    f.status,
+                    &f.path,
+                    open,
+                )
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_target = Some(target.clone())))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_diff(source.clone(), path.clone(), false, cx))),
+            )
+            .into_any_element()
     }
 
-    fn change_item(&self, ch: &Changes, item: ChangeItem, cx: &mut Context<Self>) -> AnyElement {
-        let path_args = |cmd: &[&str], path: &str| cmd.iter().map(|s| s.to_string()).chain([crate::git::literal(path)]).collect::<Vec<_>>();
-        // Every line is LIST_ROW_H tall: the list only builds the visible ones.
-        let line = div().w_full().h(px(LIST_ROW_H)).flex().flex_col().justify_end();
-        match item {
-            ChangeItem::Header(group, n) => {
-                let (title, action): (&'static str, Option<(&'static str, &'static str, &'static [&'static str])>) = match group {
-                    FileGroup::Conflicts => ("CONFLITS", None),
-                    FileGroup::Unstaged => ("NON INDEXÉS", Some(("stage-all", "Tout cocher", &["add", "-A"]))),
-                    FileGroup::Staged => ("DANS LE COMMIT", Some(("unstage-all", "Tout décocher", &["reset", "-q"]))),
-                };
-                line.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .pb_0p5()
-                        .child(label(title))
-                        .child(badge(n, false))
-                        .child(div().flex_1())
-                        .children(action.map(|(id, text, args)| {
-                            button_sm(id).ghost().label(text).on_click(
-                                cx.listener(move |this, _: &ClickEvent, window, cx| this.run(GitJob::new(text, args).status_only(), window, cx)),
-                            )
-                        })),
-                )
-                .into_any_element()
-            }
-            ChangeItem::File(FileGroup::Conflicts, i) => {
-                let path = &ch.conflicted[i];
-                let a = path_args(&["add", "--"], path);
-                line.child(self.file_row(("conflict", i), &('U', path.clone()), DiffSource::Unstaged, Some((false, a)), cx)).into_any_element()
-            }
-            ChangeItem::File(FileGroup::Unstaged, i) => {
-                let f = &ch.unstaged[i];
-                let a = path_args(&["add", "--"], &f.1);
-                let target = MenuTarget::File(f.1.clone(), f.0 == 'A');
-                line.child(
-                    self.file_row(("unstaged", i), f, DiffSource::Unstaged, Some((false, a)), cx)
-                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_target = Some(target.clone()))),
-                )
-                .into_any_element()
-            }
-            ChangeItem::File(FileGroup::Staged, i) => {
-                let f = &ch.staged[i];
-                let a = path_args(&["reset", "-q", "--"], &f.1);
-                line.child(self.file_row(("staged", i), f, DiffSource::Staged, Some((true, a)), cx)).into_any_element()
-            }
-        }
+    /// Above the message: amend the last commit (not pushed yet), or undo it.
+    fn last_commit_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = pal();
+        let check = if self.amend { Check::All } else { Check::None };
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id("amend")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .child(check_box("amend-box", check))
+                    .child(div().text_xs().text_color(c(p.muted)).child("Modifier le dernier commit"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_amend(window, cx))),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("undo-commit")
+                    .text_xs()
+                    .text_color(c(p.faint))
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(c(p.accent)))
+                    .child("Annuler le dernier commit")
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.undo_commit(window, cx))),
+            )
     }
 
-    fn changes_panel(&self, pr: &Project, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Changes view: the changed files and the commit message on the left, the diff on the right.
+    fn changes_view(&self, pr: &Project, cx: &mut Context<Self>) -> AnyElement {
         let p = pal();
         let ch = &pr.history.changes;
+        if ch.files.is_empty() {
+            return div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .p_8()
+                .child(appear(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .max_w(px(420.))
+                        .child(Icon::new(IconName::CircleCheck).size(px(40.)).text_color(c(p.green)))
+                        .child(div().text_xl().font_weight(gpui::FontWeight::SEMIBOLD).text_color(c(p.text)).child("Aucune modification locale"))
+                        .child(div().text_sm().text_center().text_color(c(p.muted)).child(
+                            "Tes fichiers sont identiques au dernier commit. Modifie-les dans ton éditeur : \
+                             ils apparaîtront ici, prêts à être cochés pour le prochain commit.",
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    button("show-history")
+                                        .outline()
+                                        .icon(icon("history"))
+                                        .label("Voir l'historique")
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.set_view(View::History, cx))),
+                                )
+                                .when(crate::app::rewritable(&pr.history), |d| {
+                                    d.child(
+                                        button("undo-commit-empty")
+                                            .ghost()
+                                            .icon(IconName::Undo2)
+                                            .label("Annuler le dernier commit")
+                                            .tooltip("Ses modifications reviennent ici, cochées, avec son message")
+                                            .disabled(self.busy.is_some())
+                                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.undo_commit(window, cx))),
+                                    )
+                                }),
+                        ),
+                    "no-changes",
+                    8.,
+                    0.,
+                ))
+                .into_any_element();
+        }
         // Virtualized: a project without .gitignore can list tens of thousands of files.
         let files = uniform_list(
             "changes-list",
-            Self::change_items(ch).len(),
+            ch.files.len(),
             cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
                 let Some(pr) = &this.proj else { return vec![] };
-                let ch = &pr.history.changes;
-                let items = Self::change_items(ch);
-                range.filter_map(|ix| items.get(ix).map(|item| this.change_item(ch, *item, cx))).collect::<Vec<_>>()
+                let files = &pr.history.changes.files;
+                range.filter_map(|ix| files.get(ix).map(|f| this.change_row(ix, f, cx))).collect::<Vec<_>>()
             }),
         )
-        .flex_1();
-        let n = ch.staged.len();
+        .flex_1()
+        .px_2();
+        let all = if ch.files.iter().all(|f| f.check == Check::All) {
+            Check::All
+        } else if ch.files.iter().any(|f| f.check != Check::None) {
+            Check::Part
+        } else {
+            Check::None
+        };
+        let n = ch.files.len();
+        let checked = ch.staged.len();
+        let branch = pr.history.head.clone();
         let key = if cfg!(target_os = "macos") { "⌘↩" } else { "Ctrl+↩" };
-        div()
-            .id("changes-panel")
-            .w(px(self.panel_w()))
+        let rewritable = crate::app::rewritable(&pr.history);
+        let amend = self.amend && rewritable;
+        let column = div()
+            .id("changes-column")
+            .w(px(self.files_w()))
             .flex_none()
             .flex()
             .flex_col()
             .bg(c(p.panel))
-            .border_l_1()
+            .border_r_1()
             .border_color(c(p.border))
-            .child(div().flex_none().px_5().pt_4().text_lg().font_weight(gpui::FontWeight::SEMIBOLD).text_color(c(p.text)).child("Modifications locales"))
-            .child(appear(
-                self.with_menu(div().id("changes-files").flex_1().min_h_0().flex().flex_col().px_3().pb_3().child(files), cx),
-                "changes-in",
-                6.,
-                0.,
-            ))
+            .child(
+                div()
+                    .h(px(40.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(c(p.border))
+                    .child(check_box("check-all", all).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        let (what, args): (&'static str, &[&str]) = match all {
+                            Check::All => ("Tout décocher", &["reset", "-q"]),
+                            _ => ("Tout cocher", &["add", "-A"]),
+                        };
+                        this.run(GitJob::new(what, args).status_only(), window, cx)
+                    })))
+                    .child(div().flex_1().text_sm().font_weight(gpui::FontWeight::MEDIUM).text_color(c(p.text)).child(match n {
+                        1 => "1 fichier modifié".to_owned(),
+                        n => format!("{n} fichiers modifiés"),
+                    }))
+                    .child(div().text_xs().text_color(c(p.faint)).child(format!("{checked} coché{}", if checked > 1 { "s" } else { "" }))),
+            )
+            .child(self.with_menu(div().id("changes-files").flex_1().min_h_0().flex().flex_col().pt_1().child(files), cx))
             .child(
                 div()
                     .flex_none()
-                    .p_4()
+                    .p_3()
                     .flex()
                     .flex_col()
-                    .gap_3()
+                    .gap_2()
                     .border_t_1()
                     .border_color(c(p.border))
-                    .child(Input::new(&self.message).h(px(100.)))
+                    .when(rewritable, |d| d.child(self.last_commit_bar(cx)))
+                    .child(Input::new(&self.summary))
+                    .child(Input::new(&self.description).h(px(84.)))
                     .child(
                         button("commit")
                             .primary()
                             .w_full()
                             .h(px(38.))
                             .icon(icon("git-commit"))
-                            .label(match n {
-                                0 => "Commit".to_owned(),
-                                1 => "Commit 1 fichier".to_owned(),
-                                n => format!("Commit {n} fichiers"),
+                            .label(match (amend, checked) {
+                                (true, _) => "Modifier le dernier commit".to_owned(),
+                                (_, 0) => format!("Commit sur {branch}"),
+                                (_, 1) => format!("Commit 1 fichier sur {branch}"),
+                                (_, n) => format!("Commit {n} fichiers sur {branch}"),
                             })
-                            .disabled(n == 0 || self.busy.is_some())
+                            .disabled((checked == 0 && !amend) || self.busy.is_some())
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.commit(window, cx))),
                     )
-                    .child(div().text_xs().text_color(c(p.faint)).child(format!("{key} pour valider · clic droit sur un fichier pour l'abandonner"))),
-            )
+                    .child(div().text_xs().text_color(c(p.faint)).child(match (amend, checked) {
+                        (true, _) => "Les fichiers cochés rejoignent le dernier commit".to_owned(),
+                        (_, 0) => "Coche les fichiers à inclure dans le commit".to_owned(),
+                        _ => format!("{key} pour valider · clic droit : abandonner un fichier"),
+                    })),
+            );
+        let diff = match &self.diff {
+            Some(d) => self.diff_view(d, cx).into_any_element(),
+            None => div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(c(p.faint))
+                .child("Choisis un fichier pour voir ses modifications")
+                .into_any_element(),
+        };
+        div().flex_1().min_w_0().flex().child(column).child(div().flex_1().min_w_0().flex().flex_col().child(diff)).into_any_element()
     }
 
     fn details_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -929,7 +1199,7 @@ impl Rameau {
             cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                 let Some(d) = &this.details else { return vec![] };
                 range
-                    .filter_map(|i| d.files.get(i).map(|f| div().w_full().h(px(LIST_ROW_H)).flex().flex_col().justify_center().child(this.file_row(("file", i), f, DiffSource::Commit(id), None, cx))))
+                    .filter_map(|i| d.files.get(i).map(|f| div().w_full().h(px(LIST_ROW_H)).flex().flex_col().justify_center().child(this.file_row(("file", i), f, DiffSource::Commit(id), cx))))
                     .collect::<Vec<_>>()
             }),
         )
@@ -968,7 +1238,7 @@ impl Rameau {
                         .flex()
                         .items_center()
                         .gap_3()
-                        .child(avatar(&d.author, 34.))
+                        .child(self.author_avatar(&d.email, &d.author, 34.))
                         .child(
                             div()
                                 .flex()
@@ -1027,7 +1297,11 @@ impl Rameau {
     fn resize_handle(&self, side: Side, x: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal();
         let active = self.resizing == Some(side);
-        let id = if side == Side::Left { "resize-left" } else { "resize-right" };
+        let id = match side {
+            Side::Left => "resize-left",
+            Side::Right => "resize-right",
+            Side::Files => "resize-files",
+        };
         div()
                     .id(id)
                     .group(id)
@@ -1155,6 +1429,99 @@ impl Rameau {
     }
 }
 
+/// A file line: its box when it can be checked, status letter, name, then its folder, faded.
+fn file_line(id: impl Into<gpui::ElementId>, check: Option<gpui::Stateful<gpui::Div>>, status: char, path: &str, open: bool) -> gpui::Stateful<gpui::Div> {
+    let p = pal();
+    let (dir, name) = path.rsplit_once('/').map_or(("", path), |(d, n)| (d, n));
+    div()
+        .id(id.into())
+        .h(px(30.))
+        .flex()
+        .items_center()
+        .gap_2p5()
+        .px_2()
+        .rounded(px(7.))
+        .cursor_pointer()
+        .when(open, |d| d.bg(c(p.selected)))
+        .when(!open, |d| d.hover(|s| s.bg(c(p.hover))))
+        .children(check)
+        .child(
+            div()
+                .size(px(18.))
+                .flex_none()
+                .rounded(px(4.))
+                .bg(gpui::Rgba { a: 0.14, ..status_color(status) })
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(status_color(status))
+                .child(status.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .gap_1p5()
+                .text_sm()
+                .child(div().flex_none().text_color(c(p.text)).child(name.to_owned()))
+                .child(div().min_w_0().truncate().text_xs().pt_0p5().text_color(c(p.faint)).child(dir.to_owned())),
+        )
+}
+
+/// Box of a changed file (or of all of them): checked, half (some lines only), or empty.
+fn check_box(id: impl Into<gpui::ElementId>, check: Check) -> gpui::Stateful<gpui::Div> {
+    let p = pal();
+    let filled = check != Check::None;
+    div()
+        .id(id.into())
+        .size(px(16.))
+        .flex_none()
+        .rounded(px(5.))
+        .border_1()
+        .border_color(c(if filled { p.accent } else { p.faint }))
+        .when(filled, |d| d.bg(c(p.accent)))
+        .hover(|s| s.border_color(c(p.accent)))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(filled, |d| {
+            let mark = if check == Check::All { IconName::Check } else { IconName::Minus };
+            d.child(Icon::new(mark).text_color(c(p.bg)).with_animation(
+                ("pop", check as usize),
+                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                |icon, t| icon.size(px(6. + 6. * t)),
+            ))
+        })
+}
+
+/// "#123" next to a branch with an open pull request; opens it on GitHub.
+fn pr_pill(id: (&'static str, usize), pr: &crate::github::PullRequest) -> impl IntoElement {
+    let p = pal();
+    let url = pr.url.clone();
+    div()
+        .id(id)
+        .flex_none()
+        .px_1p5()
+        .h(px(18.))
+        .flex()
+        .items_center()
+        .rounded(px(5.))
+        .bg(alpha(p.green, 0.14))
+        .text_xs()
+        .text_color(c(p.green))
+        .cursor_pointer()
+        .hover(|s| s.bg(alpha(p.green, 0.26)))
+        .child(format!("#{}", pr.number))
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            cx.open_url(&url)
+        })
+}
+
 fn sidebar_row(id: (&'static str, usize), selected: bool) -> gpui::Stateful<gpui::Div> {
     let p = pal();
     div()
@@ -1194,12 +1561,10 @@ fn paint_graph(bounds: Bounds<Pixels>, row: &Row, is_merge: bool, window: &mut W
     let (top, mid, bottom) = (o.y, o.y + px(ROW_H / 2.), o.y + px(ROW_H));
     let visible = |lane: usize| lane < crate::graph::MAX_LANES;
     for s in &row.segments {
-        if !visible(s.from) || !visible(s.to) {
-            continue;
-        }
+        let (from, to) = (s.from as usize, s.to as usize);
         let (a, b): (Point<Pixels>, Point<Pixels>) = match s.half {
-            Half::Top => (point(x(s.from), top), point(x(s.to), mid)),
-            Half::Bottom => (point(x(s.from), mid), point(x(s.to), bottom)),
+            Half::Top => (point(x(from), top), point(x(to), mid)),
+            Half::Bottom => (point(x(from), mid), point(x(to), bottom)),
         };
         let mut path = PathBuilder::stroke(px(2.));
         path.move_to(a);
@@ -1211,7 +1576,7 @@ fn paint_graph(bounds: Bounds<Pixels>, row: &Row, is_merge: bool, window: &mut W
             path.cubic_bezier_to(b, point(a.x, my), point(b.x, my));
         }
         if let Ok(p) = path.build() {
-            window.paint_path(p, lane_color(s.color));
+            window.paint_path(p, lane_color(s.color as usize));
         }
     }
     if visible(row.lane) {
@@ -1228,22 +1593,19 @@ impl Render for Rameau {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal();
         self.viewport_w = f32::from(window.viewport_size().width);
-        let right_w = if self.selection == Selection::None { 0. } else { self.panel_w() };
+        let right_w = if self.view == View::History && self.details.is_some() { self.panel_w() } else { 0. };
         self.center_w = self.viewport_w - self.sidebar_w() - right_w;
         let body: AnyElement = match (&self.proj, self.page) {
             (_, Page::Import) | (None, _) if !self.loading => self.import_page(cx).into_any_element(),
             (None, _) => div().flex_1().flex().items_center().justify_center().text_sm().text_color(c(p.muted)).child("Chargement…").into_any_element(),
             (Some(pr), _) => {
-                let main = match &self.diff {
-                    Some(d) => self.diff_view(d, cx).into_any_element(),
-                    None => self.commit_list(pr, cx).into_any_element(),
-                };
-                let right = match self.selection {
-                    Selection::Changes => Some(self.changes_panel(pr, cx).into_any_element()),
-                    Selection::Commit(_) => self.details_panel(cx).map(|p| p.into_any_element()),
-                    Selection::None => None,
+                let (main, right) = match (self.view, &self.diff) {
+                    (View::Changes, _) => (self.changes_view(pr, cx), None),
+                    (View::History, Some(d)) => (self.diff_view(d, cx).into_any_element(), self.details_panel(cx).map(|p| p.into_any_element())),
+                    (View::History, None) => (self.commit_list(pr, cx), self.details_panel(cx).map(|p| p.into_any_element())),
                 };
                 let has_right = right.is_some();
+                let changes = self.view == View::Changes && !pr.history.changes.files.is_empty();
                 div()
                     .flex_1()
                     .min_h_0()
@@ -1254,6 +1616,7 @@ impl Render for Rameau {
                     .children(right)
                     .child(self.resize_handle(Side::Left, self.sidebar_w(), cx))
                     .when(has_right, |d| d.child(self.resize_handle(Side::Right, self.viewport_w - self.panel_w(), cx)))
+                    .when(changes, |d| d.child(self.resize_handle(Side::Files, self.sidebar_w() + self.files_w(), cx)))
                     .into_any_element()
             }
         };
@@ -1323,20 +1686,5 @@ mod tests {
         assert!(operation(git2::Repository::open(&dir).unwrap().state()).is_none());
         assert_eq!(operation(RepositoryState::Merge).unwrap().abort, ["merge", "--abort"]);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn change_items_skip_empty_groups_in_order() {
-        let ch = Changes {
-            staged: vec![('M', "a".into())],
-            unstaged: (0..20_000).map(|i| ('A', format!("node_modules/{i}"))).collect(),
-            conflicted: vec![],
-        };
-        let items = Rameau::change_items(&ch);
-        assert_eq!(items.len(), 2 + 20_001);
-        assert_eq!(items[0], ChangeItem::Header(FileGroup::Unstaged, 20_000));
-        assert_eq!(items[1], ChangeItem::File(FileGroup::Unstaged, 0));
-        assert_eq!(items[20_001], ChangeItem::Header(FileGroup::Staged, 1));
-        assert_eq!(items[20_002], ChangeItem::File(FileGroup::Staged, 0));
     }
 }

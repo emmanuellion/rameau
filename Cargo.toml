@@ -2,11 +2,13 @@
 name = "rameau"
 version = "0.1.0"
 edition = "2024"
-description = "Client git graphique rapide, en Rust et GPUI"
+description = "Fast, native Git GUI client written in Rust with GPUI"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/emmanuellion/rameau"
-homepage = "https://github.com/emmanuellion/rameau"
+homepage = "https://emmanuellion.github.io/rameau/"
 readme = "README.md"
+keywords = ["git", "gui", "git-client", "gpui", "desktop"]
+categories = ["development-tools", "gui"]
 
 [dependencies]
 # runtime_shaders: compile Metal shaders at launch, so no full Xcode is needed to build
@@ -36,3 +38,11 @@ lto = "thin"
 # removed from libc 0.2.190 on Linux. Drop this pin when moving to a newer gpui.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "=0.2.189"
+
+# shortcut: GPUI 0.2.2 vendored (sources only, no examples) with two changes:
+# - src/platform/mac/metal_renderer.rs ("Rameau patch"): the path antialiasing texture lives in
+#   GPU tile memory on Apple GPUs, ~70 MB less RAM;
+# - src/taffy.rs: two float literals typed (`0.0_f32`), a warning newer Rust turns into an error.
+# Drop it when GPUI ships the same change, or when moving to a newer GPUI.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }

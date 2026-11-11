@@ -5,8 +5,10 @@ use git2::{BranchType, Delta, Diff, DiffOptions, Oid, Repository, RepositoryStat
 
 use crate::graph::{self, Row};
 
-// shortcut: history is capped to keep startup instant; load lazily on scroll when big repos matter.
-const MAX_COMMITS: usize = 50_000;
+// shortcut: commits past this are not listed at all; raise it if someone scrolls that far.
+const MAX_COMMITS: usize = 500_000;
+/// Commits read and laid out at a time: only the ones scrolled to take memory.
+pub const PAGE: usize = 100;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum RefKind {
@@ -26,6 +28,7 @@ pub struct Commit {
     pub id: Oid,
     pub summary: String,
     pub author: String,
+    pub email: String,
     pub time: i64,
     pub refs: Vec<RefLabel>,
 }
@@ -52,11 +55,23 @@ pub struct History {
     pub has_commits: bool,
     /// (ahead, behind) of the HEAD branch vs its upstream; None when it has no upstream.
     pub ahead_behind: Option<(usize, usize)>,
+    /// The HEAD commit is on a server already: undoing or amending it would rewrite shared history.
+    pub head_published: bool,
     pub state: RepositoryState,
     pub changes: Changes,
+    /// Every commit of the history, in display order (20 bytes each).
+    pub order: Vec<Oid>,
+    /// The commits read so far: the first `commits.len()` of `order`, with their graph rows.
     pub commits: Vec<Commit>,
     pub rows: Vec<Row>,
+    layout: graph::Layout<Oid>,
+    /// Labels of the commits not read yet.
+    labels: HashMap<Oid, Vec<RefLabel>>,
+    /// Lane color of commits carrying a ref: from the branch name, so it doesn't shift.
+    ref_colors: HashMap<Oid, usize>,
+    /// Row (index in `order`) of each branch tip.
     pub branches: Vec<Branch>,
+    /// Widest graph among the rows read so far.
     pub max_lanes: usize,
     /// `fingerprint` at load time: when it hasn't moved, the history is still up to date.
     pub fingerprint: u64,
@@ -72,7 +87,9 @@ pub struct Details {
     pub files: Vec<(char, String)>,
 }
 
-pub fn load(repo: &mut Repository) -> Result<History, git2::Error> {
+/// Reads the refs, the status and the order of the whole history, but the commits themselves
+/// only up to `at_least` (at least a page): `load_more` reads the next ones when scrolled to.
+pub fn load(repo: &mut Repository, at_least: usize) -> Result<History, git2::Error> {
     let mut stashes = Vec::new();
     repo.stash_foreach(|index, message, id| {
         stashes.push(Stash { index, message: message.to_owned(), id: *id });
@@ -134,38 +151,18 @@ pub fn load(repo: &mut Repository) -> Result<History, git2::Error> {
             _ => name.to_owned(),
         }
     };
-    let color_names: HashMap<Oid, String> = labels
+    let ref_colors: HashMap<Oid, usize> = labels
         .iter()
-        .filter_map(|(id, ls)| ls.iter().min_by_key(|l| l.kind as u8).map(|l| (*id, key(&l.name, l.kind))))
+        .filter_map(|(id, ls)| ls.iter().min_by_key(|l| l.kind as u8).map(|l| (*id, graph::color_index(key(&l.name, l.kind).as_bytes()))))
         .collect();
-    let color_of = |id: &Oid| color_names.get(id).map_or_else(|| graph::color_index(id.as_bytes()), |n| graph::color_index(n.as_bytes()));
 
-    let mut walk = repo.revwalk()?;
-    walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
-    for (_, _, target) in &branches {
-        walk.push(*target)?;
-    }
-    if head.is_some() {
-        walk.push_head()?;
-    }
-
-    let mut commits = Vec::new();
-    let mut graph_input = Vec::new();
-    for id in walk.take(MAX_COMMITS) {
-        let c = repo.find_commit(id?)?;
-        graph_input.push((c.id(), c.parent_ids().collect::<Vec<_>>()));
-        commits.push(Commit {
-            id: c.id(),
-            summary: c.summary().unwrap_or("").to_owned(),
-            author: c.author().name().unwrap_or("").to_owned(),
-            time: c.time().seconds(),
-            refs: labels.remove(&c.id()).unwrap_or_default(),
-        });
-    }
-    let rows = graph::layout(&graph_input, color_of);
-    let max_lanes = rows.iter().flat_map(|r| r.segments.iter().map(|s| s.from.max(s.to)).chain([r.lane])).max().unwrap_or(0) + 1;
-
-    let index: HashMap<Oid, usize> = commits.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
+    let tips: Vec<Oid> = branches.iter().map(|(_, _, target)| *target).collect();
+    let with_head = head.as_ref().is_some_and(|h| h.target().is_some());
+    let order = match git_order(repo, with_head) {
+        Some(order) => order,
+        None => walk_order(repo, &tips, with_head)?,
+    };
+    let index: HashMap<Oid, usize> = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
     let mut branches: Vec<Branch> = branches
         .into_iter()
         .map(|(name, kind, target)| Branch { name, kind, row: index.get(&target).copied() })
@@ -177,21 +174,139 @@ pub fn load(repo: &mut Repository) -> Result<History, git2::Error> {
         .unwrap_or(repo.path())
         .file_name()
         .map_or("repo".into(), |n| n.to_string_lossy().into_owned());
-    Ok(History {
+    let head_published = match ahead_behind {
+        Some((ahead, _)) => ahead == 0,
+        // No upstream: any remote branch containing it (the branch was created from main…).
+        None => with_head && {
+            let args = ["for-each-ref", "--count=1", "--contains", "HEAD", "--format=%(refname)", "refs/remotes"];
+            crate::git::run(repo.workdir().unwrap_or(repo.path()), &args).is_ok_and(|out| !out.is_empty())
+        },
+    };
+    let mut history = History {
         name,
         stashes,
         head: head_name,
         head_branch,
-        has_commits: head.as_ref().is_some_and(|h| h.target().is_some()),
+        has_commits: with_head,
         ahead_behind,
+        head_published,
         state: repo.state(),
         changes: changes(repo)?,
-        commits,
-        rows,
+        order,
+        commits: Vec::new(),
+        rows: Vec::new(),
+        layout: graph::Layout::default(),
+        labels,
+        ref_colors,
         branches,
-        max_lanes,
+        max_lanes: 1,
         fingerprint: fingerprint(repo),
-    })
+    };
+    load_more(repo, &mut history, at_least.max(PAGE))?;
+    Ok(history)
+}
+
+/// Every commit reachable from the branches and HEAD, children before parents, newest first.
+/// The git command reads the commit-graph file git keeps up to date when fetching: on cargo's
+/// 24,000 commits it answers in 20 ms, where libgit2's walk takes 150.
+fn git_order(repo: &Repository, with_head: bool) -> Option<Vec<Oid>> {
+    let args = history_args("rev-list", with_head, None);
+    let out = crate::git::run(repo.workdir().unwrap_or(repo.path()), &args.iter().map(String::as_str).collect::<Vec<_>>()).ok()?;
+    out.lines().map(|l| Oid::from_str(l).ok()).collect()
+}
+
+/// `git <cmd>` over the commits the history shows, in its order.
+fn history_args(cmd: &str, with_head: bool, format: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = [cmd, "--date-order", &format!("--max-count={MAX_COMMITS}"), "--branches", "--remotes"].map(str::to_owned).into();
+    args.extend(format.map(|f| format!("--format={f}")));
+    if with_head {
+        args.push("HEAD".into());
+    }
+    args
+}
+
+/// A commit as the history search sees it.
+pub struct Found {
+    pub id: Oid,
+    pub summary: String,
+    pub author: String,
+    pub email: String,
+    pub time: i64,
+    /// Summary and author in lower case, what the search compares with.
+    text: String,
+}
+
+/// Every commit of the history with what can be searched, read once by `git log` (cargo's 24,000
+/// commits: ~100 ms, 3 MB), then searched in memory at each key press.
+pub fn search_index(dir: &std::path::Path, with_head: bool) -> Result<Vec<Found>, String> {
+    let args = history_args("log", with_head, Some("%H%x00%an%x00%ae%x00%at%x00%s"));
+    let out = crate::git::run(dir, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    Ok(out
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(5, '\0');
+            let (id, author, email, time) = (Oid::from_str(f.next()?).ok()?, f.next()?, f.next()?, f.next()?);
+            let summary = f.next().unwrap_or("");
+            let text = format!("{summary}\n{author}").to_lowercase();
+            Some(Found { id, summary: summary.to_owned(), author: author.to_owned(), email: email.to_owned(), time: time.parse().ok()?, text })
+        })
+        .collect())
+}
+
+/// Commits (indexes in `index`) whose summary or author holds every word of the search, or whose
+/// hash starts with it.
+pub fn search(index: &[Found], query: &str) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    let words: Vec<&str> = q.split_whitespace().collect();
+    let hash = q.len() >= 4 && q.chars().all(|c| c.is_ascii_hexdigit());
+    index
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| (hash && f.id.to_string().starts_with(&q)) || (!words.is_empty() && words.iter().all(|w| f.text.contains(w))))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Same order through libgit2, when the git command can't answer.
+fn walk_order(repo: &Repository, tips: &[Oid], with_head: bool) -> Result<Vec<Oid>, git2::Error> {
+    let mut walk = repo.revwalk()?;
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
+    for tip in tips {
+        walk.push(*tip)?;
+    }
+    if with_head {
+        walk.push_head()?;
+    }
+    walk.take(MAX_COMMITS).collect()
+}
+
+/// Reads the commits of `order` up to `upto` (excluded) and lays out their graph rows.
+pub fn load_more(repo: &Repository, h: &mut History, upto: usize) -> Result<(), git2::Error> {
+    for i in h.commits.len()..upto.min(h.order.len()) {
+        let c = repo.find_commit(h.order[i])?;
+        let parents: Vec<Oid> = c.parent_ids().collect();
+        let colors = &h.ref_colors;
+        let color_of = |id: &Oid| colors.get(id).copied().unwrap_or_else(|| graph::color_index(id.as_bytes()));
+        let row = h.layout.push(&c.id(), &parents, color_of);
+        h.max_lanes = h.max_lanes.max(row.segments.iter().map(|s| s.from.max(s.to) as usize).chain([row.lane]).max().unwrap_or(0) + 1);
+        h.rows.push(row);
+        h.commits.push(Commit {
+            id: c.id(),
+            summary: c.summary().unwrap_or("").to_owned(),
+            author: c.author().name().unwrap_or("").to_owned(),
+            email: c.author().email().unwrap_or("").to_owned(),
+            time: c.time().seconds(),
+            refs: h.labels.remove(&c.id()).unwrap_or_default(),
+        });
+    }
+    Ok(())
+}
+
+impl History {
+    /// More commits to read below the last one shown.
+    pub fn has_more(&self) -> bool {
+        self.commits.len() < self.order.len()
+    }
 }
 
 /// Files changed in the working copy, split like `git status`.
@@ -200,6 +315,32 @@ pub struct Changes {
     pub staged: Vec<(char, String)>,
     pub unstaged: Vec<(char, String)>,
     pub conflicted: Vec<String>,
+    /// The same files once each, as the changes list shows them.
+    pub files: Vec<FileEntry>,
+}
+
+/// How much of a file goes into the next commit.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Check {
+    All,
+    Part,
+    None,
+}
+
+impl FileEntry {
+    /// The diff shown when the file is clicked: what's left to check, else what's in the commit.
+    pub fn diff_source(&self) -> DiffSource {
+        if self.check == Check::All { DiffSource::Staged } else { DiffSource::Unstaged }
+    }
+}
+
+/// A changed file of the working copy: conflicts first, then by path.
+#[derive(Clone, PartialEq, Debug)]
+pub struct FileEntry {
+    pub path: String,
+    /// A (added), D, R, M, or U (conflict).
+    pub status: char,
+    pub check: Check,
 }
 
 impl Changes {
@@ -235,7 +376,26 @@ pub fn changes(repo: &Repository) -> Result<Changes, git2::Error> {
             out.unstaged.push((letter(Status::WT_NEW, Status::WT_DELETED, Status::WT_RENAMED), path));
         }
     }
+    out.files = file_entries(&out);
     Ok(out)
+}
+
+fn file_entries(ch: &Changes) -> Vec<FileEntry> {
+    let unstaged: HashMap<&str, char> = ch.unstaged.iter().map(|(s, p)| (p.as_str(), *s)).collect();
+    let staged: HashMap<&str, char> = ch.staged.iter().map(|(s, p)| (p.as_str(), *s)).collect();
+    let mut files: Vec<FileEntry> = ch.staged.iter().map(|(_, p)| p).chain(ch.unstaged.iter().map(|(_, p)| p).filter(|p| !staged.contains_key(p.as_str()))).map(|path| {
+        // What the commit will record wins: a file added then edited again stays "A".
+        let (s, u) = (staged.get(path.as_str()), unstaged.get(path.as_str()));
+        let check = match (s, u) {
+            (Some(_), None) => Check::All,
+            (Some(_), Some(_)) => Check::Part,
+            _ => Check::None,
+        };
+        FileEntry { path: path.clone(), status: *s.or(u).unwrap_or(&'M'), check }
+    }).collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let conflicts = ch.conflicted.iter().map(|path| FileEntry { path: path.clone(), status: 'U', check: Check::None });
+    conflicts.chain(files).collect()
 }
 
 /// Which version of a file the diff view shows.
@@ -538,6 +698,14 @@ mod tests {
         assert_eq!(staged, [('A', "s".to_owned()), ('M', "b".to_owned())]);
         assert_eq!(unstaged, [('A', "n".to_owned()), ('D', "c".to_owned()), ('M', "a".to_owned())]);
         assert_eq!(ch.conflicted, ["k"]);
+        // One line per file, conflicts first; b is half in the commit after a new edit.
+        std::fs::write(dir.join("b"), "3\n").unwrap();
+        let ch = changes(&Repository::open(&dir).unwrap()).unwrap();
+        let files: Vec<(&str, char, Check)> = ch.files.iter().map(|f| (f.path.as_str(), f.status, f.check)).collect();
+        assert_eq!(
+            files,
+            [("k", 'U', Check::None), ("a", 'M', Check::None), ("b", 'M', Check::Part), ("c", 'D', Check::None), ("n", 'A', Check::None), ("s", 'A', Check::All)]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -638,7 +806,7 @@ mod tests {
         dated("c2", "2021-01-01T00:00:00");
         git(&dir, &["switch", "-qc", "side", "HEAD~2"]);
         dated("s1", "2023-01-01T00:00:00");
-        let h = load(&mut Repository::open(&dir).unwrap()).unwrap();
+        let h = load(&mut Repository::open(&dir).unwrap(), 0).unwrap();
         let pos: HashMap<Oid, usize> = h.commits.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
         let repo = Repository::open(&dir).unwrap();
         for c in &h.commits {
@@ -648,6 +816,105 @@ mod tests {
         }
         assert_eq!(h.commits.len(), 4);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_is_read_page_by_page() {
+        let dir = temp("pages");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        // 250 commits on main, a side branch leaving at the 5th and merged at the 150th
+        // (fast-import: one git process instead of 250).
+        let mut stream = String::new();
+        let mut commit = |mark: usize, branch: &str, msg: &str, from: &[usize]| {
+            stream += &format!("commit refs/heads/{branch}\nmark :{mark}\ncommitter t <t@t> {} +0000\ndata {}\n{msg}\n", 1_700_000_000 + mark, msg.len());
+            for (i, f) in from.iter().enumerate() {
+                stream += &format!("{} :{f}\n", if i == 0 { "from" } else { "merge" });
+            }
+        };
+        for i in 1..=250 {
+            match i {
+                150 => commit(i, "main", "merge", &[149, 1002]),
+                i => commit(i, "main", &format!("c{i}"), &(1..i).rev().take(1).collect::<Vec<_>>()),
+            }
+            if i == 5 {
+                commit(1001, "side", "s1", &[5]);
+                commit(1002, "side", "s2", &[1001]);
+            }
+        }
+        crate::git::exec(&dir, &["fast-import", "--quiet"], Some(&stream), None, &[]).unwrap();
+        git(&dir, &["branch", "old", ":/^c3$"]);
+
+        let repo = Repository::open(&dir).unwrap();
+        let mut h = load(&mut Repository::open(&dir).unwrap(), 0).unwrap();
+        assert_eq!((h.commits.len(), h.order.len()), (PAGE, 252), "only the first page is read");
+        assert!(h.has_more());
+        // A branch far down still knows its row, before it is read.
+        let old = h.branches.iter().find(|b| b.name == "old").unwrap().row.unwrap();
+        assert!(old > PAGE);
+        load_more(&repo, &mut h, old + 1).unwrap();
+        assert_eq!(h.commits[old].summary, "c3");
+        load_more(&repo, &mut h, usize::MAX).unwrap();
+        assert!(!h.has_more());
+        // Read in pages or at once: same commits, same graph.
+        let whole = load(&mut Repository::open(&dir).unwrap(), usize::MAX).unwrap();
+        let ids = |h: &History| h.commits.iter().map(|c| c.id).collect::<Vec<_>>();
+        assert_eq!(ids(&h), ids(&whole));
+        assert_eq!(format!("{:?}", h.rows), format!("{:?}", whole.rows));
+        assert_eq!(h.max_lanes, 2);
+        // git's order and libgit2's (the fallback) list the same commits, children first.
+        let tips: Vec<Oid> = ["main", "side", "old"].iter().map(|b| repo.revparse_single(b).unwrap().id()).collect();
+        let (by_git, by_walk) = (git_order(&repo, true).unwrap(), walk_order(&repo, &tips, true).unwrap());
+        let sorted = |v: &[Oid]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(&by_git), sorted(&by_walk));
+        assert_eq!(by_git, ids(&whole));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_search_finds_message_author_and_hash() {
+        let dir = temp("search");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        let commit = |author: &str, msg: &str| {
+            let who = format!("user.name={author}");
+            crate::git::run(&dir, &["-c", &who, "-c", "user.email=a@a", "commit", "-q", "--allow-empty", "-m", msg]).unwrap();
+        };
+        commit("Ada Lovelace", "Corrige le calcul des marges");
+        commit("Bob", "Ajoute l'export PDF\n\nCorps du message : marges");
+        commit("Ada Lovelace", "Export CSV");
+        let index = search_index(&dir, true).unwrap();
+        let found = |q: &str| search(&index, q).iter().map(|&i| index[i].summary.clone()).collect::<Vec<_>>();
+        // Newest first, like the history; words in any case, from the summary or the author.
+        assert_eq!(found("export"), ["Export CSV", "Ajoute l'export PDF"]);
+        assert_eq!(found("ADA export"), ["Export CSV"]);
+        assert_eq!(found("marges"), ["Corrige le calcul des marges"], "the summary only, not the body");
+        let hash = index[2].id.to_string();
+        assert_eq!(found(&hash[..7]), ["Corrige le calcul des marges"]);
+        assert!(found("   ").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn head_is_published_once_on_a_server() {
+        let root = temp("published");
+        git(&root, &["init", "-q", "--bare", "-b", "main", "server.git"]);
+        git(&root, &["clone", "-q", "server.git", "work"]);
+        let work = root.join("work");
+        let published = || load(&mut Repository::open(&work).unwrap(), 0).unwrap().head_published;
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "c1"]);
+        assert!(!published(), "not pushed yet");
+        git(&work, &["push", "-q", "-u", "origin", "main"]);
+        assert!(published());
+        // A new branch without upstream, still on main's pushed commit…
+        git(&work, &["switch", "-qc", "feature"]);
+        assert!(published());
+        // …then with a commit of its own.
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "c2"]);
+        assert!(!published());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -699,14 +966,14 @@ mod tests {
     fn new_repository_shows_its_branch() {
         let dir = temp("unborn");
         git(&dir, &["init", "-q", "-b", "trunk"]);
-        let h = load(&mut Repository::open(&dir).unwrap()).unwrap();
+        let h = load(&mut Repository::open(&dir).unwrap(), 0).unwrap();
         assert_eq!(h.head, "trunk");
         assert_eq!(h.head_branch.as_deref(), Some("trunk"));
         assert!(!h.has_commits && h.commits.is_empty());
         std::fs::write(dir.join("f"), "1").unwrap();
         git(&dir, &["add", "f"]);
         git(&dir, &["commit", "-qm", "first"]);
-        assert!(load(&mut Repository::open(&dir).unwrap()).unwrap().has_commits);
+        assert!(load(&mut Repository::open(&dir).unwrap(), 0).unwrap().has_commits);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

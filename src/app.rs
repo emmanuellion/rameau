@@ -5,10 +5,11 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use git2::{Oid, Repository};
 use gpui::{
-    ClipboardItem, Context, Entity, FocusHandle, HighlightStyle, PathPromptOptions, ScrollStrategy, SharedString,
+    ClipboardItem, Context, Entity, FocusHandle, HighlightStyle, Image, PathPromptOptions, ScrollStrategy, SharedString,
     Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px,
 };
 use gpui_component::{
@@ -34,7 +35,15 @@ pub struct Project {
 pub enum Selection {
     None,
     Commit(Oid),
+}
+
+/// What the main area shows, picked at the top of the sidebar.
+#[derive(Clone, Copy, PartialEq)]
+pub enum View {
+    /// Changed files to check, the commit message, the diff of a file.
     Changes,
+    /// The colored graph, the details of a commit.
+    History,
 }
 
 #[derive(Clone)]
@@ -68,6 +77,9 @@ pub struct OpenDiff {
     pub selected: BTreeSet<usize>,
     pub anchor: Option<usize>,
     pub longest: usize,
+    /// Rows of the side-by-side view, and the part that changed inside each edited line.
+    pub rows: Vec<diff_view::SplitRow>,
+    pub words: Vec<Option<Range<usize>>>,
 }
 
 /// Which panel edge is being dragged.
@@ -75,12 +87,18 @@ pub struct OpenDiff {
 pub enum Side {
     Left,
     Right,
+    /// Right edge of the changed files column.
+    Files,
 }
 
-const SIDEBAR_W: f32 = 256.;
+const SIDEBAR_W: f32 = 240.;
 const PANEL_W: f32 = 380.;
+const FILES_W: f32 = 360.;
 const SIDEBAR_RANGE: (f32, f32) = (200., 440.);
 const PANEL_RANGE: (f32, f32) = (300., 680.);
+const FILES_RANGE: (f32, f32) = (280., 640.);
+/// The diff next to the changed files keeps at least this much room.
+const DIFF_MIN_W: f32 = 360.;
 /// The history keeps at least this much room when panels grow.
 const CENTER_MIN_W: f32 = 420.;
 
@@ -163,16 +181,43 @@ pub struct Rameau {
     pub loading: bool,
     /// Project being opened: a reload meanwhile (e.g. window re-activated) must target it, not cancel it.
     pending: Option<PathBuf>,
+    pub view: View,
     pub selection: Selection,
     pub details: Option<Details>,
     pub diff: Option<OpenDiff>,
     pub scroll: UniformListScrollHandle,
     pub diff_scroll: UniformListScrollHandle,
-    pub message: Entity<InputState>,
+    /// First line of the commit message.
+    pub summary: Entity<InputState>,
+    /// Rest of the commit message, optional.
+    pub description: Entity<InputState>,
+    /// The commit button rewrites the last commit (`--amend`) instead of adding one.
+    pub amend: bool,
     pub clone_url: Entity<InputState>,
     pub clone_parent: PathBuf,
     pub busy: Option<SharedString>,
     pub login: Login,
+    /// Profile picture of the GitHub account.
+    pub avatar: Option<Arc<Image>>,
+    /// Repositories of the GitHub account (None: not asked yet), and the search among them.
+    pub gh_repos: Option<Result<Vec<github::RemoteRepo>, String>>,
+    pub repo_filter: Entity<InputState>,
+    gh_task: Option<Task<()>>,
+    /// History search: the field, what can be searched (read on the first search), the commits found.
+    pub history_search: Entity<InputState>,
+    /// The search field is shown (else a look-alike button: a GPUI text field in the history view
+    /// keeps ~90 MB of GPU memory while visible, measured, cause not found in GPUI).
+    pub search_open: bool,
+    search_index: Option<Arc<Vec<repo::Found>>>,
+    pub search_hits: Option<(Arc<Vec<repo::Found>>, Vec<usize>)>,
+    search_task: Option<Task<()>>,
+    /// Pull requests and CI results of the open project (GitHub projects, signed in).
+    pub gh_info: Option<github::RepoInfo>,
+    gh_info_task: Option<Task<()>>,
+    /// Project, refs fingerprint and time of the last reading: not asked again for a minute.
+    gh_info_at: Option<(PathBuf, u64, std::time::Instant)>,
+    /// Authors' GitHub pictures by e-mail (lower case); None while loading or when there is none.
+    pub avatars: std::collections::HashMap<String, Option<Arc<Image>>>,
     pub menu_target: Option<MenuTarget>,
     pub focus: FocusHandle,
     pub resizing: Option<Side>,
@@ -191,27 +236,44 @@ pub struct Rameau {
 
 impl Rameau {
     pub fn new(config: Config, open: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let message = cx.new(|cx| InputState::new(window, cx).multi_line(true).placeholder("Message du commit"));
+        let summary = cx.new(|cx| InputState::new(window, cx).placeholder("Résumé (obligatoire)"));
+        let description = cx.new(|cx| InputState::new(window, cx).multi_line(true).placeholder("Description"));
         let clone_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://github.com/utilisateur/projet.git"));
-        let subscriptions = vec![
+        let repo_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Rechercher un dépôt"));
+        let history_search = cx.new(|cx| InputState::new(window, cx).placeholder("Rechercher un commit : message, auteur ou hash"));
+        let mut subscriptions = vec![
             // Pick up changes made outside the app (editor, terminal) when coming back to it.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.refresh_on_focus(window, cx);
                 }
             }),
-            cx.subscribe_in(&message, window, |this, _, ev: &InputEvent, window, cx| {
+            cx.subscribe(&repo_filter, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe(&history_search, |this, _, ev: &InputEvent, cx| match ev {
+                InputEvent::Change => this.run_search(cx),
+                // Left empty: back to the button.
+                InputEvent::Blur if this.search_hits.is_none() => {
+                    this.search_open = false;
+                    // Read again (~100 ms) at the next search rather than kept for nothing.
+                    this.search_index = None;
+                    cx.notify();
+                }
+                _ => {}
+            }),
+        ];
+        // ⌘↩ (Ctrl+↩) commits from either field.
+        for input in [&summary, &description] {
+            subscriptions.push(cx.subscribe_in(input, window, |this, _, ev: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { secondary: true } = ev {
                     this.commit(window, cx);
                 }
-            }),
-        ];
+            }));
+        }
         cx.spawn(async move |this, cx| {
             let account = cx.background_executor().spawn(async { github::load() }).await;
             this.update(cx, |this, cx| {
                 if let Some(a) = account {
-                    this.login = Login::In(a);
-                    cx.notify();
+                    this.signed_in(a, cx);
                 }
             })
             .ok();
@@ -227,16 +289,32 @@ impl Rameau {
             proj: None,
             loading: false,
             pending: None,
+            view: View::History,
             selection: Selection::None,
             details: None,
             diff: None,
             scroll: UniformListScrollHandle::new(),
             diff_scroll: UniformListScrollHandle::new(),
-            message,
+            summary,
+            description,
+            amend: false,
             clone_url,
             clone_parent,
             busy: None,
             login: Login::Out,
+            avatar: None,
+            gh_repos: None,
+            repo_filter,
+            gh_task: None,
+            history_search,
+            search_open: false,
+            search_index: None,
+            search_hits: None,
+            search_task: None,
+            gh_info: None,
+            gh_info_task: None,
+            gh_info_at: None,
+            avatars: Default::default(),
             menu_target: None,
             focus,
             resizing: None,
@@ -286,10 +364,12 @@ impl Rameau {
         }
         let p = path.clone();
         let status_at_start = self.status_gen;
+        // A reload keeps the commits already scrolled through.
+        let shown = if switching { 0 } else { self.history().map_or(0, |h| h.commits.len()) };
         let task = cx.background_executor().spawn(async move {
-            let mut repo = Repository::open(&p)?;
-            let history = repo::load(&mut repo)?;
-            Ok::<_, git2::Error>((repo, history))
+            let history = repo::load(&mut Repository::open(&p)?, shown)?;
+            // A fresh handle: the one that walked the history caches every commit it read.
+            Ok::<_, git2::Error>((Repository::open(&p)?, history))
         });
         // Replacing the task cancels a load still in flight.
         self.load_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -314,12 +394,26 @@ impl Rameau {
                             this.details = None;
                             this.close_diff();
                             this.scroll = UniformListScrollHandle::new();
+                            // Something to commit: that's what the user most likely came for.
+                            this.view = if history.changes.is_empty() { View::History } else { View::Changes };
                             window.set_window_title(&format!("{} — Rameau", history.name));
                             this.config.add(&path);
                             this.config.save();
                             this.page = Page::Repo;
                         }
                         this.proj = Some(Project { path, repo, history });
+                        // The history may have changed: search it again, from a fresh index.
+                        this.search_index = None;
+                        if switching {
+                            this.history_search.update(cx, |s, cx| s.set_value("", window, cx));
+                            this.search_open = false;
+                        }
+                        this.run_search(cx);
+                        this.refresh_github(cx);
+                        this.want_avatars(cx);
+                        if switching && this.view == View::Changes {
+                            this.open_first_file(cx);
+                        }
                         this.refresh_diff(cx);
                     }
                     Err(e) => {
@@ -377,7 +471,16 @@ impl Rameau {
         });
         cx.spawn_in(window, async move |this, cx| {
             let moved = task.await;
-            this.update_in(cx, |this, window, cx| if moved { this.reload(window, cx) } else { this.refresh_status(cx) }).ok();
+            this.update_in(cx, |this, window, cx| {
+                if moved {
+                    this.reload(window, cx)
+                } else {
+                    this.refresh_status(cx);
+                    // CI results change without any ref moving.
+                    this.refresh_github(cx);
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -413,29 +516,107 @@ impl Rameau {
         cx.notify();
     }
 
-    pub fn select_changes(&mut self, cx: &mut Context<Self>) {
-        self.selection = Selection::Changes;
-        self.close_diff();
+    pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+        if self.view != view {
+            self.view = view;
+            self.close_diff();
+            if view == View::Changes {
+                self.open_first_file(cx);
+            }
+        }
         cx.notify();
     }
 
-    /// ↑/↓: walk the history (the "local changes" row sits above the first commit).
+    /// Changes view: show the first file's diff rather than an empty area.
+    fn open_first_file(&mut self, cx: &mut Context<Self>) {
+        let Some(f) = self.history().and_then(|h| h.changes.files.first()) else { return };
+        let (source, path) = (f.diff_source(), f.path.clone());
+        self.open_diff(source, path, false, cx);
+    }
+
+    /// Pictures of the authors of commits about to be read.
+    fn want_avatars_later(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| this.update(cx, |this, cx| this.want_avatars(cx)).ok()).detach();
+    }
+
+    /// Reads the commits of the history up to `upto` (they are read a page at a time, when shown).
+    pub fn load_commits(&mut self, upto: usize) {
+        let Some(p) = &mut self.proj else { return };
+        if upto > p.history.commits.len()
+            && let Err(e) = repo::load_more(&p.repo, &mut p.history, upto)
+        {
+            eprintln!("rameau: {}", e.message());
+        }
+    }
+
+    /// Shows the history search field, ready to type in.
+    pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = true;
+        self.history_search.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Filters the history with the search field (the index of every commit is read the first time).
+    pub fn run_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.history_search.read(cx).value().trim().to_owned();
+        if query.is_empty() {
+            self.search_hits = None;
+            self.search_task = None;
+            return cx.notify();
+        }
+        if let Some(index) = self.search_index.clone() {
+            let hits = repo::search(&index, &query);
+            self.search_hits = Some((index, hits));
+            return cx.notify();
+        }
+        let Some(p) = &self.proj else { return };
+        let (dir, with_head) = (p.path.clone(), p.history.has_commits);
+        let task = cx.background_executor().spawn(async move { repo::search_index(&dir, with_head) });
+        // Replacing the task drops a reading still in flight (another project opened meanwhile).
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            let index = task.await;
+            this.update(cx, |this, cx| match index {
+                Ok(index) => {
+                    this.search_index = Some(Arc::new(index));
+                    this.run_search(cx);
+                }
+                Err(e) => eprintln!("rameau: recherche : {e}"),
+            })
+            .ok();
+        }));
+    }
+
+    /// ↑/↓: walk the history.
     pub fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.want_avatars_later(cx);
+        if self.view != View::History {
+            return;
+        }
         let Some(h) = self.history() else { return };
-        let wip = !h.changes.is_empty();
         let current = match self.selection {
-            Selection::Changes => Some(-1),
             Selection::Commit(id) => h.commits.iter().position(|c| c.id == id).map(|i| i as isize),
             Selection::None => None,
         };
-        let next = current.map_or(if wip { -1 } else { 0 }, |i| i + delta);
-        if next == -1 && wip {
-            self.select_changes(cx);
-        } else if next >= 0 && (next as usize) < h.commits.len() {
-            let id = h.commits[next as usize].id;
-            self.scroll.scroll_to_item(next as usize, ScrollStrategy::Top);
-            self.select_commit(id, cx);
+        let next = current.map_or(0, |i| i + delta);
+        if next < 0 {
+            return;
         }
+        let next = next as usize;
+        self.load_commits(next + repo::PAGE);
+        let Some(id) = self.history().and_then(|h| h.commits.get(next)).map(|c| c.id) else { return };
+        self.scroll.scroll_to_item(next, ScrollStrategy::Top);
+        self.select_commit(id, cx);
+    }
+
+    /// Shows the commit at `row` of the history (a branch tip clicked in the sidebar).
+    pub fn reveal_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.want_avatars_later(cx);
+        self.view = View::History;
+        self.close_diff();
+        self.load_commits(row + repo::PAGE);
+        let Some(id) = self.history().and_then(|h| h.commits.get(row)).map(|c| c.id) else { return };
+        self.scroll.scroll_to_item(row, ScrollStrategy::Center);
+        self.select_commit(id, cx);
     }
 
     /// Computes and highlights a file diff off the UI thread (a huge generated file would
@@ -452,6 +633,8 @@ impl Rameau {
             let highlights = diff_view::highlight(&repo, &source, &path, &lines);
             let longest = lines.iter().enumerate().max_by_key(|(_, l)| l.text.len()).map_or(0, |(i, _)| i);
             let selectable = partial && !matches!(source, DiffSource::Commit(_));
+            let rows = diff_view::split_rows(&lines);
+            let words = diff_view::word_changes(&lines, &rows);
             Ok::<_, git2::Error>(OpenDiff {
                 source,
                 path,
@@ -461,6 +644,8 @@ impl Rameau {
                 selected: BTreeSet::new(),
                 anchor: None,
                 longest,
+                rows,
+                words,
             })
         });
         // Replacing the task drops a diff still loading (another file was clicked meanwhile).
@@ -490,11 +675,7 @@ impl Rameau {
 
     /// After a reload, keep the open working-copy diff in sync: it follows the file
     /// from "unstaged" to "staged" (and back), and closes when the file is clean.
-    /// Also closes the changes panel once nothing is left to commit.
     pub fn refresh_diff(&mut self, cx: &mut Context<Self>) {
-        if self.selection == Selection::Changes && self.history().is_some_and(|h| h.changes.is_empty()) {
-            self.selection = Selection::None;
-        }
         let Some(d) = &self.diff else { return };
         let Some(ch) = self.history().map(|h| &h.changes) else { return };
         let listed = |l: &[(char, String)]| l.iter().any(|(_, p)| *p == d.path);
@@ -582,29 +763,90 @@ impl Rameau {
 
     pub fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(h) = self.history() else { return };
-        if h.changes.staged.is_empty() {
+        // Amending may only change the message.
+        if h.changes.staged.is_empty() && !self.amend {
             window.push_notification(Notification::warning("Coche au moins un fichier à inclure dans le commit."), cx);
             return;
         }
-        let msg = self.message.read(cx).value().trim().to_owned();
-        if msg.is_empty() {
-            window.push_notification(Notification::warning("Écris un message de commit."), cx);
-            self.message.update(cx, |s, cx| s.focus(window, cx));
+        let summary = self.summary.read(cx).value().trim().to_owned();
+        if summary.is_empty() {
+            window.push_notification(Notification::warning("Écris un résumé du commit."), cx);
+            self.summary.update(cx, |s, cx| s.focus(window, cx));
             return;
         }
+        let description = self.description.read(cx).value().trim().to_owned();
+        let msg = if description.is_empty() { summary } else { format!("{summary}\n\n{description}") };
         // A fresh Git (Windows, Linux) has no author: git would refuse the commit in English.
         let signed = self.proj.as_ref().is_some_and(|p| Repository::open(p.repo.path()).and_then(|r| r.signature()).is_ok());
         if !signed {
-            return self.identity_dialog(window, cx);
+            return self.identity_dialog(true, window, cx);
         }
-        let job = GitJob::owned("Commit", vec!["commit".into(), "-m".into(), msg])
-            .after(|this, window, cx| this.message.update(cx, |s, cx| s.set_value("", window, cx)));
+        let amend = self.amend && self.history().is_some_and(rewritable);
+        let mut args = vec!["commit".into()];
+        if amend {
+            args.push("--amend".into());
+        }
+        args.extend(["-m".into(), msg]);
+        let job = GitJob::owned(if amend { "Modification du commit" } else { "Commit" }, args).after(|this, window, cx| {
+            this.amend = false;
+            for input in [this.summary.clone(), this.description.clone()] {
+                input.update(cx, |s, cx| s.set_value("", window, cx));
+            }
+        });
         self.run(job, window, cx);
     }
 
-    /// Asks the name and e-mail that sign commits, saves them in the user's git config, then commits.
-    fn identity_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (name0, email0) = identity_suggestion(&self.login);
+    /// "Modifier le dernier commit": its message comes back in the fields, to be edited.
+    pub fn toggle_amend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.amend = !self.amend;
+        let message = self.amend.then(|| self.head_message()).flatten();
+        let empty = self.summary.read(cx).value().trim().is_empty() && self.description.read(cx).value().trim().is_empty();
+        if let Some((summary, description)) = message.filter(|_| empty) {
+            self.summary.update(cx, |s, cx| s.set_value(summary, window, cx));
+            self.description.update(cx, |s, cx| s.set_value(description, window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Summary and description of the HEAD commit.
+    fn head_message(&self) -> Option<(String, String)> {
+        let c = self.proj.as_ref()?.repo.head().ok()?.peel_to_commit().ok()?;
+        let msg = c.message().unwrap_or("").trim().to_owned();
+        let (summary, rest) = msg.split_once('\n').unwrap_or((&msg, ""));
+        Some((summary.trim().to_owned(), rest.trim().to_owned()))
+    }
+
+    /// Takes the last commit back: its changes stay, checked, and its message returns to the fields.
+    pub fn undo_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = &self.proj else { return };
+        if !rewritable(&p.history) {
+            return;
+        }
+        let Some(parents) = p.repo.head().ok().and_then(|h| h.peel_to_commit().ok()).map(|c| c.parent_count()) else { return };
+        if parents == 0 {
+            let msg = "C'est le premier commit du dépôt : il n'y a rien avant lui où revenir.";
+            return window.push_notification(Notification::warning(msg), cx);
+        }
+        let message = self.head_message();
+        let job = GitJob::new("Annulation du commit", &["reset", "--soft", "HEAD~1"]).done("Commit annulé : ses modifications sont de nouveau cochées").after(
+            move |this, window, cx| {
+                this.view = View::Changes;
+                if let Some((summary, description)) = message {
+                    this.summary.update(cx, |s, cx| s.set_value(summary, window, cx));
+                    this.description.update(cx, |s, cx| s.set_value(description, window, cx));
+                }
+            },
+        );
+        self.run(job, window, cx);
+    }
+
+    /// Asks the name and e-mail that sign commits and saves them in the user's git config;
+    /// `then_commit`: asked by a commit, which goes on once they are saved.
+    pub fn identity_dialog(&mut self, then_commit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (current_name, current_email) = current_identity();
+        let (suggested_name, suggested_email) = identity_suggestion(&self.login);
+        let name0 = if current_name.is_empty() { suggested_name } else { current_name };
+        let email0 = if current_email.is_empty() { suggested_email.clone() } else { current_email };
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("Prénom Nom").default_value(name0));
         let email = cx.new(|cx| InputState::new(window, cx).placeholder("toi@exemple.com").default_value(email0));
         let (weak, focus) = (cx.weak_entity(), name.clone());
@@ -620,14 +862,24 @@ impl Rameau {
                      Ils sont enregistrés une fois pour tous tes projets.",
                 ))
                 .child(Input::new(&name))
-                .child(Input::new(&email));
-            ui::with_footer(dialog.title("Qui signe les commits ?").child(body), "Enregistrer et committer", false, move |window, cx| {
+                .child(Input::new(&email))
+                .when(!suggested_email.is_empty(), |d| {
+                    d.child(div().text_xs().text_color(theme::c(p.faint)).child(format!(
+                        "Pour garder ton adresse privée, GitHub te propose : {suggested_email}"
+                    )))
+                });
+            let ok = if then_commit { "Enregistrer et committer" } else { "Enregistrer" };
+            ui::with_footer(dialog.title("Qui signe les commits ?").child(body), ok, false, move |window, cx| {
                 let (n, e) = (name.read(cx).value().trim().to_owned(), email.read(cx).value().trim().to_owned());
                 if let Err(msg) = save_identity(&n, &e, &[]) {
                     window.push_notification(Notification::warning(msg), cx);
                     return false;
                 }
-                weak.update(cx, |this, cx| this.commit(window, cx)).ok();
+                if then_commit {
+                    weak.update(cx, |this, cx| this.commit(window, cx)).ok();
+                } else {
+                    window.push_notification(Notification::success("Identité enregistrée pour tes prochains commits"), cx);
+                }
                 true
             })
         });
@@ -822,7 +1074,7 @@ impl Rameau {
                             })
                             .detach();
                         window.push_notification(Notification::success(format!("Connecté en tant que {}", a.login)), cx);
-                        this.login = Login::In(a);
+                        this.signed_in(a, cx);
                     }
                     Err(e) => {
                         this.notify_error("Connexion GitHub", e, window, cx);
@@ -842,6 +1094,161 @@ impl Rameau {
         }
         self.login = Login::Out;
         self.login_task = None;
+        self.avatar = None;
+        self.gh_repos = None;
+        self.gh_task = None;
+        self.gh_info = None;
+        self.gh_info_task = None;
+        cx.notify();
+    }
+
+    /// Signed in: fetches the profile picture and the list of repositories in the background.
+    fn signed_in(&mut self, a: github::Account, cx: &mut Context<Self>) {
+        if let Some(url) = a.avatar_url.clone() {
+            cx.spawn(async move |this, cx| {
+                let pic = cx.background_executor().spawn(async move { github::avatar(&url) }).await;
+                this.update(cx, |this, cx| {
+                    // Still the same sign-in (not logged out meanwhile).
+                    if let (Some((bytes, format)), Login::In(_)) = (pic, &this.login) {
+                        this.avatar = Some(Arc::new(Image::from_bytes(format, bytes)));
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        self.login = Login::In(a);
+        self.fetch_repos(cx);
+        self.gh_info_at = None;
+        self.refresh_github(cx);
+        cx.notify();
+    }
+
+    /// Reads the pull requests and CI results of the open project in the background, when it lives on
+    /// github.com and the user is signed in. At most once a minute while its refs stay the same.
+    pub fn refresh_github(&mut self, cx: &mut Context<Self>) {
+        let (Some(token), Some(p)) = (self.token(), &self.proj) else { return };
+        let remote = push_remote(&p.repo);
+        let slug = p.repo.find_remote(&remote).ok().and_then(|r| r.url().and_then(github::repo_slug));
+        let Some(slug) = slug else {
+            self.gh_info = None;
+            return;
+        };
+        let fresh = |(path, fp, at): &(PathBuf, u64, std::time::Instant)| {
+            *path == p.path && *fp == p.history.fingerprint && at.elapsed() < std::time::Duration::from_secs(60)
+        };
+        if self.gh_info_at.as_ref().is_some_and(fresh) {
+            return;
+        }
+        if self.gh_info.as_ref().is_some_and(|i| i.slug != slug) {
+            self.gh_info = None;
+        }
+        self.gh_info_at = Some((p.path.clone(), p.history.fingerprint, std::time::Instant::now()));
+        // Local branches as github.com has them: their CI ran on the pushed commit.
+        let branches: Vec<(String, String)> = p
+            .history
+            .branches
+            .iter()
+            .filter(|b| b.kind != RefKind::Remote)
+            .filter_map(|b| {
+                let pushed = p.repo.find_reference(&format!("refs/remotes/{remote}/{}", b.name)).ok()?.target()?;
+                Some((b.name.clone(), pushed.to_string()))
+            })
+            .collect();
+        let task = cx.background_executor().spawn(async move { github::repo_info(&token, &slug, branches) });
+        self.gh_info_task = Some(cx.spawn(async move |this, cx| {
+            let info = task.await;
+            this.update(cx, |this, cx| {
+                match info {
+                    Ok(info) => {
+                        this.gh_info = Some(info);
+                        this.want_avatars(cx);
+                    }
+                    Err(e) => eprintln!("rameau: GitHub : {e}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Fetches the GitHub pictures of the authors of the commits read so far: from their "noreply"
+    /// address, or from what GitHub said about the recent commits. Each picture is asked once.
+    pub fn want_avatars(&mut self, cx: &mut Context<Self>) {
+        // shortcut: at most 300 pictures (~5 MB); the next authors keep their initials.
+        const MAX: usize = 300;
+        let Some(p) = &self.proj else { return };
+        let known = self.gh_info.as_ref().map(|i| &i.avatars);
+        let mut todo: Vec<(String, String)> = Vec::new();
+        for c in &p.history.commits {
+            if self.avatars.len() + todo.len() >= MAX {
+                break;
+            }
+            let email = c.email.to_lowercase();
+            if self.avatars.contains_key(&email) || todo.iter().any(|(e, _)| *e == email) {
+                continue;
+            }
+            if let Some(url) = github::noreply_avatar(&email).or_else(|| known.and_then(|k| k.get(&email).cloned())) {
+                todo.push((email, url));
+            }
+        }
+        if todo.is_empty() {
+            return;
+        }
+        for (email, _) in &todo {
+            self.avatars.insert(email.clone(), None);
+        }
+        let task = cx.background_executor().spawn(async move {
+            // 8 at a time: quick without opening dozens of connections at once.
+            todo.chunks(8)
+                .flat_map(|chunk| {
+                    std::thread::scope(|s| {
+                        let handles: Vec<_> = chunk.iter().map(|(email, url)| s.spawn(move || (email.clone(), github::avatar(url)))).collect();
+                        handles.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let pictures = task.await;
+            this.update(cx, |this, cx| {
+                for (email, picture) in pictures {
+                    if let Some((bytes, format)) = picture {
+                        this.avatars.insert(email, Some(Arc::new(Image::from_bytes(format, bytes))));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// An author's GitHub picture, when it is known and loaded.
+    pub fn avatar_of(&self, email: &str) -> Option<Arc<Image>> {
+        self.avatars.get(&email.to_lowercase())?.clone()
+    }
+
+    /// Pull request open for `branch`, if any.
+    pub fn pull_request(&self, branch: &str) -> Option<&github::PullRequest> {
+        self.gh_info.as_ref()?.pulls.iter().find(|p| p.branch == branch)
+    }
+
+    /// (Re)reads the account's repositories for the import page.
+    pub fn fetch_repos(&mut self, cx: &mut Context<Self>) {
+        let Some(token) = self.token() else { return };
+        self.gh_repos = None;
+        let task = cx.background_executor().spawn(async move { github::repos(&token) });
+        // Replacing the task drops a listing still in flight (logout, refresh).
+        self.gh_task = Some(cx.spawn(async move |this, cx| {
+            let repos = task.await;
+            this.update(cx, |this, cx| {
+                this.gh_repos = Some(repos);
+                cx.notify();
+            })
+            .ok();
+        }));
         cx.notify();
     }
 
@@ -858,16 +1265,24 @@ impl Rameau {
         self.widths().1
     }
 
+    /// Changed files column: what the user chose, leaving the diff its minimum.
+    pub fn files_w(&self) -> f32 {
+        let room = self.viewport_w - self.sidebar_w() - DIFF_MIN_W;
+        self.config.files_width.unwrap_or(FILES_W).min(room).max(FILES_RANGE.0)
+    }
+
     /// Follows the mouse while a panel edge is dragged (`x` from the window's left edge).
     pub fn resize(&mut self, side: Side, x: f32, window_w: f32, cx: &mut Context<Self>) {
         let (w, min, max) = match side {
             Side::Left => (x, SIDEBAR_RANGE.0, SIDEBAR_RANGE.1.min(window_w - self.panel_w() - CENTER_MIN_W)),
             Side::Right => (window_w - x, PANEL_RANGE.0, PANEL_RANGE.1.min(window_w - self.sidebar_w() - CENTER_MIN_W)),
+            Side::Files => (x - self.sidebar_w(), FILES_RANGE.0, FILES_RANGE.1.min(window_w - self.sidebar_w() - DIFF_MIN_W)),
         };
         let w = w.clamp(min, max.max(min)).round();
         match side {
             Side::Left => self.config.sidebar_width = Some(w),
             Side::Right => self.config.panel_width = Some(w),
+            Side::Files => self.config.files_width = Some(w),
         }
         cx.notify();
     }
@@ -884,6 +1299,7 @@ impl Rameau {
         match side {
             Side::Left => self.config.sidebar_width = None,
             Side::Right => self.config.panel_width = None,
+            Side::Files => self.config.files_width = None,
         }
         self.config.save();
         cx.notify();
@@ -898,6 +1314,12 @@ impl Rameau {
             }
             None => c.push(key.to_owned()),
         }
+        self.config.save();
+        cx.notify();
+    }
+
+    pub fn toggle_split(&mut self, cx: &mut Context<Self>) {
+        self.config.split_diff = !self.config.split_diff;
         self.config.save();
         cx.notify();
     }
@@ -965,12 +1387,22 @@ impl Rameau {
         }
     }
 
+    /// Clones the address typed on the import page.
     pub fn clone_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let url = self.clone_url.read(cx).value().trim().to_owned();
+        self.clone_from(url, window, cx);
+    }
+
+    /// Clones `url` into the chosen folder, then opens it.
+    pub fn clone_from(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(name) = repo_name(&url) else {
             return window.push_notification(Notification::warning("Colle l'adresse du dépôt à cloner."), cx);
         };
         let dest = self.clone_parent.join(name);
+        // Cloned earlier: open it rather than complain.
+        if Repository::open(&dest).ok().and_then(|r| r.find_remote("origin").ok()?.url().map(|u| u == url)).unwrap_or(false) {
+            return self.import_path(dest, window, cx);
+        }
         if dest.exists() {
             let msg = format!("{} existe déjà : choisis un autre dossier de destination.", dest.display());
             return window.push_notification(Notification::warning(msg), cx);
@@ -986,6 +1418,12 @@ impl Rameau {
             });
         self.run(job, window, cx);
     }
+}
+
+/// The last commit can be undone or amended: there is one, on a branch, nothing half-done, and no
+/// server has it yet (rewriting it there would need a forced push and break others' copies).
+pub fn rewritable(h: &History) -> bool {
+    h.has_commits && h.head_branch.is_some() && h.state == git2::RepositoryState::Clean && !h.head_published
 }
 
 /// A full load read the file statuses before a status refresh that started after it (e.g. a
@@ -1007,6 +1445,12 @@ pub fn fit_widths(viewport: f32, (mut sidebar, mut panel): (f32, f32)) -> (f32, 
         sidebar -= (over - from_panel).min(sidebar - SIDEBAR_RANGE.0).max(0.);
     }
     (sidebar, panel)
+}
+
+/// Name and e-mail that sign commits now, from the user's global git config (empty when unset).
+fn current_identity() -> (String, String) {
+    let get = |key| git::run(&config::home(), &["config", "--global", "--get", key]).unwrap_or_default();
+    (get("user.name"), get("user.email"))
 }
 
 /// Name and e-mail suggested to sign commits, from the GitHub account. Nothing when the account
@@ -1192,16 +1636,16 @@ pub(crate) mod tests {
         std::fs::write(dir.join("f"), "1\n").unwrap();
         let open = || git2::Repository::open(&dir).unwrap();
         // The full load reads the status first: f is not staged yet...
-        let mut loaded = crate::repo::load(&mut open()).unwrap();
+        let mut loaded = crate::repo::load(&mut open(), 0).unwrap();
         assert_eq!(loaded.changes.staged.len(), 0);
         // ...then f gets checked and the status refresh lands before the load.
         git(&dir, &["add", "f"]);
-        let mut current = super::Project { path: dir.clone(), repo: open(), history: crate::repo::load(&mut open()).unwrap() };
+        let mut current = super::Project { path: dir.clone(), repo: open(), history: crate::repo::load(&mut open(), 0).unwrap() };
         assert_eq!(current.history.changes.staged.len(), 1);
         super::keep_fresher_changes(&mut loaded, Some(&mut current), true);
         assert_eq!(loaded.changes.staged.len(), 1, "the late load must not uncheck f");
         // Not stale: the load's own result is used.
-        let mut fresh = crate::repo::load(&mut open()).unwrap();
+        let mut fresh = crate::repo::load(&mut open(), 0).unwrap();
         fresh.changes.staged.clear();
         super::keep_fresher_changes(&mut fresh, Some(&mut current), false);
         assert!(fresh.changes.staged.is_empty());
@@ -1221,12 +1665,12 @@ pub(crate) mod tests {
         use super::{Login, identity_suggestion};
         use crate::github::Account;
         let account = |name: Option<&str>, email: &str| {
-            Login::In(Account { login: "ada".into(), token: "t".into(), name: name.map(Into::into), noreply_email: email.into() })
+            Login::In(Account { login: "ada".into(), token: "t".into(), name: name.map(Into::into), noreply_email: email.into(), avatar_url: None })
         };
         let checked = account(Some("Ada Lovelace"), "1+ada@users.noreply.github.com");
         assert_eq!(identity_suggestion(&checked), ("Ada Lovelace".into(), "1+ada@users.noreply.github.com".into()));
         // Started offline: the account was kept, but nothing about it is known yet.
-        let offline = Login::In(Account { login: "GitHub".into(), token: "t".into(), name: None, noreply_email: String::new() });
+        let offline = Login::In(Account { login: "GitHub".into(), token: "t".into(), name: None, noreply_email: String::new(), avatar_url: None });
         assert_eq!(identity_suggestion(&offline), (String::new(), String::new()));
         assert_eq!(identity_suggestion(&Login::Out), (String::new(), String::new()));
     }
@@ -1254,9 +1698,14 @@ pub(crate) mod tests {
         std::fs::write(&hook, format!("#!/bin/sh\nprintf '%s' \"$RAMEAU_TOKEN\" > '{}'\n", leak.display())).unwrap();
         #[cfg(unix)]
         std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // Without the machine's git config: a github.com login stored there (GitHub Desktop, gh…)
+        // rightly keeps the token away from git, which is not what this test is about.
+        let global = dir.join("gitconfig-vide");
+        std::fs::write(&global, "").unwrap();
+        let env = [("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()), ("GIT_CONFIG_GLOBAL".to_owned(), global.display().to_string())];
         let commit = |token| {
             let args = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"];
-            crate::git::exec(&dir, &args, None, token, &[]).unwrap();
+            crate::git::exec(&dir, &args, None, token, &env).unwrap();
             std::fs::read_to_string(&leak).unwrap()
         };
         // What run() passes to a commit: no token, nothing to read.

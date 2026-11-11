@@ -10,12 +10,15 @@ pub enum Half {
     Bottom,
 }
 
+/// 4 bytes: a long history keeps tens of thousands of rows of them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Segment {
     pub half: Half,
-    pub from: usize,
-    pub to: usize,
-    pub color: usize,
+    /// Lanes, under MAX_LANES.
+    pub from: u8,
+    pub to: u8,
+    /// Under PALETTE.
+    pub color: u8,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -39,46 +42,56 @@ pub fn color_index(bytes: &[u8]) -> usize {
     (bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)) >> 32) as usize
 }
 
-/// `commits[i] = (id, parent ids)`. Ids are any comparable value (git Oids in the app).
-/// `color_of(id)` gives the color of a lane starting at `id`: deriving it from the commit
-/// (or its branch name) keeps colors stable when new commits arrive.
-pub fn layout<T: PartialEq + Clone>(commits: &[(T, Vec<T>)], color_of: impl Fn(&T) -> usize) -> Vec<Row> {
-    // Each lane waits for a given commit and carries a color.
-    let mut lanes: Vec<Option<(T, usize)>> = Vec::new();
-    let free_slot = |lanes: &mut Vec<Option<(T, usize)>>| {
-        lanes.iter().position(Option::is_none).unwrap_or_else(|| {
-            lanes.push(None);
-            lanes.len() - 1
-        })
-    };
+/// Lane state carried from one row to the next, so the history can be laid out page by page.
+/// Each lane waits for a given commit and carries a color.
+pub struct Layout<T> {
+    lanes: Vec<Option<(T, usize)>>,
+}
 
-    // A new lane avoids the colors of lanes already on screen (when there are few enough).
-    let distinct = |lanes: &[Option<(T, usize)>], c: usize| {
-        (0..PALETTE)
-            .map(|k| (c + k) % PALETTE)
-            .find(|c| !lanes.iter().flatten().any(|(_, used)| used % PALETTE == *c))
-            .unwrap_or(c % PALETTE)
-    };
-    let mut rows = Vec::with_capacity(commits.len());
-    for (id, parents) in commits {
+impl<T: PartialEq + Clone> Default for Layout<T> {
+    fn default() -> Self {
+        Layout { lanes: Vec::new() }
+    }
+}
+
+impl<T: PartialEq + Clone> Layout<T> {
+    /// Row of the next commit (commits come children before parents). `color_of(id)` gives the
+    /// color of a lane starting at `id`: deriving it from the commit (or its branch name) keeps
+    /// colors stable when new commits arrive.
+    pub fn push(&mut self, id: &T, parents: &[T], color_of: impl Fn(&T) -> usize) -> Row {
+        let lanes = &mut self.lanes;
+        let free_slot = |lanes: &mut Vec<Option<(T, usize)>>| {
+            lanes.iter().position(Option::is_none).unwrap_or_else(|| {
+                lanes.push(None);
+                lanes.len() - 1
+            })
+        };
+        // A new lane avoids the colors of lanes already on screen (when there are few enough).
+        let distinct = |lanes: &[Option<(T, usize)>], c: usize| {
+            (0..PALETTE)
+                .map(|k| (c + k) % PALETTE)
+                .find(|c| !lanes.iter().flatten().any(|(_, used)| used % PALETTE == *c))
+                .unwrap_or(c % PALETTE)
+        };
         let waiting = |l: &Option<(T, usize)>| l.as_ref().is_some_and(|(w, _)| w == id);
         let lane = match lanes.iter().position(waiting) {
             Some(i) => i,
-            None => free_slot(&mut lanes),
+            None => free_slot(lanes),
         };
-        let color = lanes[lane].as_ref().map_or_else(|| distinct(&lanes, color_of(id)), |(_, c)| *c);
-        let mut segments = Vec::new();
+        let color = lanes[lane].as_ref().map_or_else(|| distinct(lanes, color_of(id)), |(_, c)| *c);
+        // (half, from, to, color): lanes are only trimmed to MAX_LANES at the end.
+        let mut segments: Vec<(Half, usize, usize, usize)> = Vec::new();
 
         // Lines coming from above: lanes waiting for this commit converge on it, others pass through.
         for (i, l) in lanes.iter_mut().enumerate() {
             let Some((w, c)) = l.as_ref() else { continue };
             let c = *c;
             if w == id {
-                segments.push(Segment { half: Half::Top, from: i, to: lane, color: c });
+                segments.push((Half::Top, i, lane, c));
                 *l = None;
             } else {
-                segments.push(Segment { half: Half::Top, from: i, to: i, color: c });
-                segments.push(Segment { half: Half::Bottom, from: i, to: i, color: c });
+                segments.push((Half::Top, i, i, c));
+                segments.push((Half::Bottom, i, i, c));
             }
         }
 
@@ -88,8 +101,8 @@ pub fn layout<T: PartialEq + Clone>(commits: &[(T, Vec<T>)], color_of: impl Fn(&
                 // A lane further right already waits for our first parent: pull it into ours,
                 // so the leftmost branch (usually main) stays straight.
                 Some(j) if n == 0 && j > lane => {
-                    if let Some(s) = segments.iter_mut().find(|s| s.half == Half::Bottom && s.from == j && s.to == j) {
-                        s.to = lane;
+                    if let Some(s) = segments.iter_mut().find(|s| s.0 == Half::Bottom && s.1 == j && s.2 == j) {
+                        s.2 = lane;
                     }
                     lanes[j] = None;
                     lanes[lane] = Some((p.clone(), color));
@@ -98,25 +111,34 @@ pub fn layout<T: PartialEq + Clone>(commits: &[(T, Vec<T>)], color_of: impl Fn(&
                 Some(j) => j,
                 None => {
                     // First parent continues this lane in the same color; merged parents get a new lane.
-                    let (j, c) = if n == 0 { (lane, color) } else { (free_slot(&mut lanes), distinct(&lanes, color_of(p))) };
+                    let (j, c) = if n == 0 { (lane, color) } else { (free_slot(lanes), distinct(lanes, color_of(p))) };
                     lanes[j] = Some((p.clone(), c));
                     j
                 }
             };
             // The first-parent line belongs to this commit's branch, a merge line to the merged branch.
             let c = if n == 0 { color } else { lanes[target].as_ref().unwrap().1 };
-            segments.push(Segment { half: Half::Bottom, from: lane, to: target, color: c });
+            segments.push((Half::Bottom, lane, target, c));
         }
 
         // Drop trailing empty lanes so the graph doesn't stay wide forever.
         while lanes.last().is_some_and(Option::is_none) {
             lanes.pop();
         }
-        segments.retain(|s| s.from.max(s.to) < MAX_LANES);
-        segments.shrink_to_fit();
-        rows.push(Row { lane, color, segments });
+        let segments = segments
+            .into_iter()
+            .filter(|s| s.1.max(s.2) < MAX_LANES)
+            .map(|(half, from, to, color)| Segment { half, from: from as u8, to: to as u8, color: (color % PALETTE) as u8 })
+            .collect();
+        Row { lane, color, segments }
     }
-    rows
+}
+
+/// Whole layout at once: `commits[i] = (id, parent ids)`, ids being any comparable value.
+#[cfg(test)]
+pub fn layout<T: PartialEq + Clone>(commits: &[(T, Vec<T>)], color_of: impl Fn(&T) -> usize) -> Vec<Row> {
+    let mut l = Layout::default();
+    commits.iter().map(|(id, parents)| l.push(id, parents, &color_of)).collect()
 }
 
 #[cfg(test)]
@@ -127,7 +149,7 @@ mod tests {
         *i
     }
 
-    fn seg(half: Half, from: usize, to: usize, color: usize) -> Segment {
+    fn seg(half: Half, from: u8, to: u8, color: u8) -> Segment {
         Segment { half, from, to, color }
     }
 
@@ -173,7 +195,7 @@ mod tests {
         let tips: Vec<(usize, Vec<usize>)> = (1..=200).map(|i| (i, vec![0])).collect();
         let rows = layout(&[tips, vec![(0, vec![])]].concat(), id);
         let kept: usize = rows.iter().map(|r| r.segments.len()).sum();
-        assert!(rows.iter().flat_map(|r| &r.segments).all(|s| s.from.max(s.to) < MAX_LANES));
+        assert!(rows.iter().flat_map(|r| &r.segments).all(|s| (s.from.max(s.to) as usize) < MAX_LANES));
         // Without the trim, row n alone has ~2n segments (≈ 40,000 in total here).
         assert!(kept < 200 * MAX_LANES * 2, "{kept} segments kept");
         assert_eq!(rows[200].lane, 0, "the root still sits in the first lane");

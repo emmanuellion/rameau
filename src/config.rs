@@ -15,6 +15,9 @@ pub struct Config {
     /// Widths chosen by dragging the panel edges (None: default).
     pub sidebar_width: Option<f32>,
     pub panel_width: Option<f32>,
+    pub files_width: Option<f32>,
+    /// Diffs shown side by side (old left, new right) rather than in one column.
+    pub split_diff: bool,
 }
 
 /// `~/Library/Application Support/rameau` on macOS, `$XDG_CONFIG_HOME/rameau` (or `~/.config/rameau`)

@@ -29,6 +29,9 @@ impl AssetSource for Assets {
             "icons/rameau/refresh-cw.svg" => Some(include_bytes!("../assets/icons/refresh-cw.svg")),
             "icons/rameau/cloud.svg" => Some(include_bytes!("../assets/icons/cloud.svg")),
             "icons/rameau/archive.svg" => Some(include_bytes!("../assets/icons/archive.svg")),
+            "icons/rameau/square-pen.svg" => Some(include_bytes!("../assets/icons/square-pen.svg")),
+            "icons/rameau/history.svg" => Some(include_bytes!("../assets/icons/history.svg")),
+            "icons/rameau/lock.svg" => Some(include_bytes!("../assets/icons/lock.svg")),
             _ => None,
         };
         match ours {
@@ -42,7 +45,8 @@ impl AssetSource for Assets {
     }
 }
 
-/// One of Rameau's icons: `git-branch`, `git-commit`, `refresh-cw`, `cloud`, `archive`.
+/// One of Rameau's icons: `git-branch`, `git-commit`, `refresh-cw`, `cloud`, `archive`, `square-pen`,
+/// `history`, `lock`.
 pub fn icon(name: &str) -> Icon {
     Icon::empty().path(format!("icons/rameau/{name}.svg"))
 }
