@@ -216,6 +216,9 @@ impl Rameau {
                     .when(ahead > 0, |b| b.child(badge(ahead, true)))
                     .when(push_primary, |b| b.primary())
                     .when(!push_primary, |b| b.ghost())
+                    .when(matches!(self.login, Login::Out), |b| {
+                        b.tooltip("Envoyer tes commits. Vers GitHub : connecte-toi (en haut à droite), ou utilise tes identifiants git habituels.")
+                    })
                     .disabled(busy || h.head_branch.is_none() || !h.has_commits)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.push(window, cx))),
             )
@@ -306,7 +309,8 @@ impl Rameau {
             Login::Out => button("account")
                 .ghost()
                 .icon(IconName::GitHub)
-                .label("Se connecter")
+                .label("Connexion GitHub")
+                .tooltip("Facultatif : pour pousser vers GitHub, voir tes pull requests et cloner tes dépôts")
                 .dropdown_menu_with_anchor(Corner::TopRight, menu)
                 .into_any_element(),
             Login::In(a) => {
@@ -1638,14 +1642,6 @@ impl Render for Rameau {
             .flex_col()
             .bg(c(p.bg))
             .text_color(c(p.text))
-            .key_context("Rameau")
-            .track_focus(&self.focus)
-            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.move_selection(-1, cx)))
-            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_selection(1, cx)))
-            .on_action(cx.listener(|this, _: &CloseDiff, _, cx| {
-                this.close_diff();
-                cx.notify();
-            }))
             // Drop a folder anywhere to import it.
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 if let Some(path) = paths.paths().first() {
@@ -1666,8 +1662,23 @@ impl Render for Rameau {
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.end_resize(cx)))
             .child(self.title_bar(cx))
             // Fade when switching page, project or theme.
+            // Focus is tracked here, below the title bar: a focusable element takes every mouse down
+            // inside it (prevent_default), and on Windows that would keep the title bar's drag area
+            // and its minimize/maximize/close buttons from ever reaching the system.
             .child(appear(
-                div().flex_1().min_h_0().flex().child(body),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .key_context("Rameau")
+                    .track_focus(&self.focus)
+                    .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.move_selection(-1, cx)))
+                    .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_selection(1, cx)))
+                    .on_action(cx.listener(|this, _: &CloseDiff, _, cx| {
+                        this.close_diff();
+                        cx.notify();
+                    }))
+                    .child(body),
                 ("page", key((self.page == Page::Import, self.dir(), self.config.light))),
                 0.,
                 0.,

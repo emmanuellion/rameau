@@ -162,12 +162,15 @@ Empaqueter à la main : `scripts/package-macos.sh` (`.app` + `.dmg`), `scripts/p
 <details>
 <summary>Publier une version</summary>
 
-1. Change `version` dans `Cargo.toml`, puis `cargo check` (met à jour `Cargo.lock`), et commite.
-2. `git tag v0.2.0 && git push origin main v0.2.0`
+Le travail se fait sur la branche `develop` ; les releases ne partent que de `main`.
+
+1. Sur `develop`, change `version` dans `Cargo.toml`, puis `cargo check` (met à jour `Cargo.lock`), et commite.
+2. Fusionne `develop` dans `main` : `git checkout main && git merge develop`
+3. `git tag v0.3.0 && git push origin main v0.3.0`
 
 La pipeline [Release](.github/workflows/release.yml) compile macOS (universel), Linux (x64, ARM) et
-Windows (x64), puis publie la release GitHub avec les paquets et leurs sommes SHA-256.
-Elle refuse un tag qui ne correspond pas à la version de `Cargo.toml`.
+Windows (x64, installateur et `.zip`), puis publie la release GitHub avec les paquets et leurs sommes SHA-256.
+Elle refuse un tag qui ne correspond pas à la version de `Cargo.toml`, ou qui n'est pas sur `main`.
 </details>
 
 <details>

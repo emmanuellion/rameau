@@ -13,7 +13,8 @@ use gpui::{
     Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px,
 };
 use gpui_component::{
-    WindowExt,
+    Sizable, WindowExt,
+    button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     notification::Notification,
 };
@@ -347,6 +348,28 @@ impl Rameau {
             Login::In(a) => Some(a.token.clone()),
             _ => None,
         }
+    }
+
+    /// A push or pull the server refused for lack of credentials: what to do, then git's own words.
+    fn login_needed(&self, what: &str, git_msg: String, window: &mut Window, cx: &mut Context<Self>) {
+        let signed_in = matches!(self.login, Login::In(_));
+        let advice = if signed_in {
+            "Le serveur a refusé ton compte GitHub connecté : vérifie que tu as le droit d'écrire sur ce dépôt."
+        } else {
+            "Le serveur demande qui tu es. Connecte-toi avec GitHub, ou configure tes identifiants git \
+             habituels (clé SSH, gestionnaire d'identifiants), puis réessaie."
+        };
+        let mut n = Notification::warning(format!("{advice}\n\n{git_msg}")).title(format!("{what} : identification requise")).autohide(false);
+        if !signed_in {
+            let weak = cx.weak_entity();
+            n = n.action(move |_, _, _| {
+                let weak = weak.clone();
+                Button::new("notify-login").primary().small().label("Se connecter avec GitHub").on_click(move |_, window, cx| {
+                    weak.update(cx, |this, cx| this.login(window, cx)).ok();
+                })
+            });
+        }
+        window.push_notification(n, cx);
     }
 
     pub fn notify_error(&self, title: &str, msg: impl Into<SharedString>, window: &mut Window, cx: &mut Context<Self>) {
@@ -709,7 +732,7 @@ impl Rameau {
         self.busy = Some(format!("{}…", job.what).into());
         cx.notify();
         let token = if job.network { self.token() } else { None };
-        let GitJob { what, args, input, env, done, after, status_only, .. } = job;
+        let GitJob { what, args, input, env, done, after, status_only, network, .. } = job;
         let task = cx.background_executor().spawn(async move {
             let a: Vec<&str> = args.iter().map(String::as_str).collect();
             git::exec(&dir, &a, input.as_deref(), token.as_deref(), &env)
@@ -732,6 +755,7 @@ impl Rameau {
                         Notification::warning("Des conflits sont à résoudre avant de continuer.").title(format!("{what} : conflits")),
                         cx,
                     ),
+                    Err(e) if network && needs_login(&e) => this.login_needed(what, e, window, cx),
                     Err(e) => this.notify_error(&format!("{what} : échec"), e, window, cx),
                 }
                 if status_only {
@@ -1478,6 +1502,21 @@ pub fn save_identity(name: &str, email: &str, env: &[(String, String)]) -> Resul
 
 /// Where a new branch gets published, like git decides: `remote.pushDefault`, else `origin`,
 /// else the only (or first) remote.
+/// Git's ways of saying the server wants credentials it was not given (prompts are disabled).
+fn needs_login(git_msg: &str) -> bool {
+    [
+        "could not read Username",
+        "terminal prompts disabled",
+        "Authentication failed",
+        "Invalid username or password",
+        "Permission denied (publickey)",
+        "The requested URL returned error: 403",
+        "The requested URL returned error: 401",
+    ]
+    .iter()
+    .any(|s| git_msg.contains(s))
+}
+
 pub fn push_remote(repo: &Repository) -> String {
     let names: Vec<String> = repo.remotes().map(|r| r.iter().flatten().map(str::to_owned).collect()).unwrap_or_default();
     repo.config()
@@ -1550,7 +1589,7 @@ pub fn repo_name(url: &str) -> Option<&str> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::GitJob;
+    use super::{GitJob, needs_login};
     use std::path::Path;
 
     /// Temp folder unique to this test run.
@@ -1715,6 +1754,17 @@ pub(crate) mod tests {
         assert_eq!(commit(Some("s3cret")), "s3cret");
         assert!(GitJob::new("Push", &["push"]).network().network);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refused_credentials_are_recognized() {
+        // HTTPS without any login (prompts disabled), with a wrong one, and SSH without a key.
+        assert!(needs_login("fatal: could not read Username for 'https://github.com': terminal prompts disabled"));
+        assert!(needs_login("remote: Invalid username or password.\nfatal: Authentication failed for 'https://github.com/a/b.git/'"));
+        assert!(needs_login("git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository."));
+        // Other failures keep their own message.
+        assert!(!needs_login("! [rejected]        main -> main (fetch first)"));
+        assert!(!needs_login("fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host: github.com"));
     }
 
     #[test]

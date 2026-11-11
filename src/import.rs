@@ -9,7 +9,7 @@ use gpui_component::{
 
 use crate::app::{Login, Page, Rameau};
 use crate::github::RemoteRepo;
-use crate::theme::{c, mono, pal};
+use crate::theme::{alpha, c, mono, pal};
 use crate::ui::{appear, button, button_sm, icon};
 
 /// Height of a repository line: the list is virtualized.
@@ -167,6 +167,7 @@ impl Rameau {
                  au sélecteur de projets (en haut à gauche) : aucun fichier n'est copié ni déplacé, et le retirer \
                  de la liste ne supprime rien sur le disque.",
             ))
+            .when(matches!(self.login, Login::Out), |el| el.child(account_note()))
             .child(appear(self.github_card(cx), "card-gh", 10., 0.))
             .child(appear(
                 card(
@@ -260,6 +261,36 @@ impl Rameau {
             });
         div().id("import-page").flex_1().min_w_0().min_h_0().flex().flex_col().overflow_y_scroll().child(page)
     }
+}
+
+/// Signed out: says that no account is needed to work, and what sending commits to GitHub takes.
+fn account_note() -> impl IntoElement {
+    let p = pal();
+    div()
+        .flex_none()
+        .flex()
+        .gap_3()
+        .p_4()
+        .rounded_lg()
+        .border_1()
+        .border_color(alpha(p.accent, 0.35))
+        .bg(alpha(p.accent, 0.08))
+        .child(div().pt(px(2.)).child(Icon::new(IconName::Info).small().text_color(c(p.accent))))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).text_color(c(p.text)).child("Pas besoin de compte pour commencer"))
+                .child(div().text_sm().text_color(c(p.muted)).child(
+                    "Ouvrir un projet, parcourir l'historique et committer se font sans compte : Rameau travaille sur les \
+                     dépôts de ton ordinateur. Pour envoyer tes commits vers GitHub (Push), connecte-toi avec GitHub, \
+                     à l'étape 1 ou en haut à droite. Si tu utilises déjà git avec une clé SSH ou un gestionnaire \
+                     d'identifiants, Rameau s'en sert : tu n'as rien à faire.",
+                )),
+        )
 }
 
 fn repo_row(i: usize, r: &RemoteRepo, busy: bool, cx: &mut Context<Rameau>) -> AnyElement {

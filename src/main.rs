@@ -43,7 +43,14 @@ fn main() {
             KeyBinding::new("down", SelectNext, Some("Rameau")),
             KeyBinding::new("escape", CloseDiff, Some("Rameau")),
         ]);
-        let bounds = Bounds::centered(None, size(px(1320.), px(820.)), cx);
+        // Never larger than the screen: at 150 % scaling, 1320×820 is taller than a 1080p display
+        // and the bottom of the window (import page included) would be out of reach.
+        let wanted = size(px(1320.), px(820.));
+        let fit = cx.primary_display().map_or(wanted, |d| {
+            let screen = d.bounds().size;
+            wanted.min(&size(screen.width * 0.9, screen.height * 0.85))
+        });
+        let bounds = Bounds::centered(None, fit, cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["git", "gui", "git-client", "gpui", "desktop"]
 categories = ["development-tools", "gui"]
 
+# Windows: the app icon inside rameau.exe (build.rs). Already a build dependency of GPUI.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"
+
 [dependencies]
 # runtime_shaders: compile Metal shaders at launch, so no full Xcode is needed to build
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }

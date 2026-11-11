@@ -159,8 +159,8 @@ sudo apt install build-essential pkg-config cmake clang git \
 
 Packaging: `scripts/package-macos.sh` (`.app` + `.dmg`), `scripts/package-linux.sh` (AppImage + `.tar.gz`) and
 `packaging/windows/rameau.iss` ([Inno Setup](https://jrsoftware.org/isinfo.php) installer).
-Releases are built by the [Release workflow](.github/workflows/release.yml) when a `v*` tag matching
-`Cargo.toml` is pushed.
+Development happens on the `develop` branch. Releases are built by the
+[Release workflow](.github/workflows/release.yml) when a `v*` tag matching `Cargo.toml` is pushed on a commit of `main`.
 
 <details>
 <summary>Where settings and credentials live</summary>
