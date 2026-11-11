@@ -561,7 +561,6 @@ impl Rameau {
             .gap_2p5()
             .rounded(px(8.))
             .cursor_pointer()
-            .when(active, |d| d.bg(c(p.selected)))
             .when(!active, |d| d.hover(|s| s.bg(c(p.hover))))
             .child(ico.small().text_color(c(if active { p.accent } else { p.muted })))
             .child(
@@ -574,6 +573,10 @@ impl Rameau {
             )
             .children(count.filter(|n| *n > 0).map(|n| badge(n, false)))
             .on_click(cx.listener(move |this, _, _, cx| this.set_view(view, cx)))
+            // The active item's background fades in when it becomes active.
+            .with_animation((title, active as usize), Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()), move |d, t| {
+                if active { d.bg(alpha(p.selected, t)) } else { d }
+            })
     }
 
     fn sidebar(&self, pr: &Project, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1612,7 +1615,16 @@ impl Render for Rameau {
                     .flex()
                     .relative()
                     .child(self.sidebar(pr, cx))
-                    .child(div().id("center").flex_1().min_w_0().flex().flex_col().children(self.state_banner(pr, cx)).child(main))
+                    .child(
+                        div()
+                            .id("center")
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .children(self.state_banner(pr, cx).map(|b| appear(div().child(b), "banner", -8., 0.)))
+                            .child(appear(div().flex_1().min_h_0().flex().flex_col().child(main), ("view", key(self.view)), 0., 0.)),
+                    )
                     .children(right)
                     .child(self.resize_handle(Side::Left, self.sidebar_w(), cx))
                     .when(has_right, |d| d.child(self.resize_handle(Side::Right, self.viewport_w - self.panel_w(), cx)))
@@ -1653,10 +1665,10 @@ impl Render for Rameau {
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.end_resize(cx)))
             .child(self.title_bar(cx))
-            // Fade when switching page or project.
+            // Fade when switching page, project or theme.
             .child(appear(
                 div().flex_1().min_h_0().flex().child(body),
-                ("page", key((self.page == Page::Import, self.dir()))),
+                ("page", key((self.page == Page::Import, self.dir(), self.config.light))),
                 0.,
                 0.,
             ))

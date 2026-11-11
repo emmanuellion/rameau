@@ -38,7 +38,7 @@ pub enum Selection {
 }
 
 /// What the main area shows, picked at the top of the sidebar.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Hash)]
 pub enum View {
     /// Changed files to check, the commit message, the diff of a file.
     Changes,
