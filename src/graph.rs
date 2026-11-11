@@ -25,6 +25,11 @@ pub struct Row {
     pub segments: Vec<Segment>,
 }
 
+// shortcut: wider graphs are clipped; make the graph column resizable if repos need it.
+/// Lanes drawn. Segments of the lanes further right are not kept: with hundreds of long-lived
+/// branches they would take hundreds of MB (2 per active lane per row) for nothing on screen.
+pub const MAX_LANES: usize = 14;
+
 /// Number of lane colors in the UI palette.
 pub const PALETTE: usize = 10;
 
@@ -107,6 +112,8 @@ pub fn layout<T: PartialEq + Clone>(commits: &[(T, Vec<T>)], color_of: impl Fn(&
         while lanes.last().is_some_and(Option::is_none) {
             lanes.pop();
         }
+        segments.retain(|s| s.from.max(s.to) < MAX_LANES);
+        segments.shrink_to_fit();
         rows.push(Row { lane, color, segments });
     }
     rows
@@ -158,6 +165,18 @@ mod tests {
     fn side_by_side_lanes_never_share_a_color() {
         let rows = layout(&[(3, vec![1]), (2, vec![1]), (1, vec![])], |_| 7);
         assert_eq!((rows[0].color, rows[1].color), (7, 8));
+    }
+
+    #[test]
+    fn lanes_beyond_the_drawn_ones_keep_no_segments() {
+        // 200 branches started from the same root and still open: 200 lanes side by side.
+        let tips: Vec<(usize, Vec<usize>)> = (1..=200).map(|i| (i, vec![0])).collect();
+        let rows = layout(&[tips, vec![(0, vec![])]].concat(), id);
+        let kept: usize = rows.iter().map(|r| r.segments.len()).sum();
+        assert!(rows.iter().flat_map(|r| &r.segments).all(|s| s.from.max(s.to) < MAX_LANES));
+        // Without the trim, row n alone has ~2n segments (≈ 40,000 in total here).
+        assert!(kept < 200 * MAX_LANES * 2, "{kept} segments kept");
+        assert_eq!(rows[200].lane, 0, "the root still sits in the first lane");
     }
 
     #[test]

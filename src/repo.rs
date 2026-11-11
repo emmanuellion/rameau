@@ -255,6 +255,8 @@ pub enum LineKind {
     Info,
     /// "\ No newline at end of file", about the line just above.
     NoNewline,
+    /// Conflict marker line (`<<<<<<<`, `=======`, `>>>>>>>`) of a file being merged.
+    Marker,
 }
 
 pub struct DiffLine {
@@ -262,6 +264,13 @@ pub struct DiffLine {
     pub old: Option<u32>,
     pub new: Option<u32>,
     pub text: String,
+}
+
+impl DiffLine {
+    /// A message line in the diff view (no line numbers).
+    pub fn info(text: &str) -> Self {
+        DiffLine { kind: LineKind::Info, old: None, new: None, text: text.to_owned() }
+    }
 }
 
 /// Lines of the diff of one file. The bool tells whether lines can be staged one by one
@@ -280,9 +289,16 @@ pub fn file_diff(repo: &Repository, source: &DiffSource, path: &str) -> Result<(
             repo.diff_index_to_workdir(None, Some(&mut opts))?
         }
     };
-    let partial = diff.deltas().len() == 1 && diff.deltas().all(|d| d.status() == Delta::Modified);
+    // A conflicted file has no diff: show it as it is on disk, markers included.
+    if *source == DiffSource::Unstaged && diff.deltas().any(|d| d.status() == Delta::Conflicted) {
+        return Ok((conflict_lines(repo, path), false));
+    }
+    let mut partial = diff.deltas().len() == 1 && diff.deltas().all(|d| d.status() == Delta::Modified);
     let mut lines = Vec::new();
     diff.print(git2::DiffFormat::Patch, |_, hunk, l| {
+        // Line patches are rebuilt from text: a non-UTF-8 file (Latin-1…) would get "�" written
+        // into it. Such files are then staged or discarded whole, byte for byte.
+        partial &= std::str::from_utf8(l.content()).is_ok();
         let kind = match l.origin() {
             ' ' => LineKind::Context,
             '+' => LineKind::Added,
@@ -311,19 +327,37 @@ pub fn file_diff(repo: &Repository, source: &DiffSource, path: &str) -> Result<(
     Ok((lines, partial))
 }
 
+/// The working file of a conflicted path, line by line, markers flagged, with how to resolve it.
+fn conflict_lines(repo: &Repository, path: &str) -> Vec<DiffLine> {
+    let info = DiffLine::info;
+    let file = repo.workdir().map(|w| w.join(path));
+    let Some(bytes) = file.and_then(|f| std::fs::read(f).ok()) else {
+        return vec![info("Fichier en conflit, absent du disque : il a été supprimé d'un côté et modifié de l'autre.")];
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = vec![info("Garde la bonne version entre les marqueurs dans ton éditeur, enregistre, puis coche le fichier.")];
+    lines.extend(text.split_inclusive('\n').enumerate().map(|(i, l)| {
+        let l = l.trim_end_matches('\n');
+        let marker = ["<<<<<<<", "|||||||", "=======", ">>>>>>>"].iter().any(|m| l.starts_with(m));
+        DiffLine { kind: if marker { LineKind::Marker } else { LineKind::Context }, old: None, new: Some(i as u32 + 1), text: l.to_owned() }
+    }));
+    lines
+}
+
 /// Full (old, new) contents of the file on both sides of the diff, for syntax highlighting.
+/// Files over this size get no syntax colors (generated, minified, dumps): they are not even read.
+pub const MAX_HIGHLIGHT_BYTES: usize = 1 << 20;
+
 pub fn file_versions(repo: &Repository, source: &DiffSource, path: &str) -> (Option<String>, Option<String>) {
     let p = std::path::Path::new(path);
-    let blob = |tree: Option<git2::Tree>| -> Option<String> {
-        let entry = tree?.get_path(p).ok()?;
-        let blob = repo.find_blob(entry.id()).ok()?;
+    // Size from the object header first: loading a 2 GB blob just to skip it is what we avoid.
+    let small = |id: Oid| repo.odb().and_then(|o| o.read_header(id)).is_ok_and(|(size, _)| size <= MAX_HIGHLIGHT_BYTES);
+    let text = |id: Oid| -> Option<String> {
+        let blob = small(id).then(|| repo.find_blob(id).ok()).flatten()?;
         (!blob.is_binary()).then(|| String::from_utf8_lossy(blob.content()).into_owned())
     };
-    let index = || -> Option<String> {
-        let entry = repo.index().ok()?.get_path(p, 0)?;
-        let blob = repo.find_blob(entry.id).ok()?;
-        (!blob.is_binary()).then(|| String::from_utf8_lossy(blob.content()).into_owned())
-    };
+    let blob = |tree: Option<git2::Tree>| -> Option<String> { text(tree?.get_path(p).ok()?.id()) };
+    let index = || -> Option<String> { text(repo.index().ok()?.get_path(p, 0)?.id) };
     let head = || repo.head().ok().and_then(|h| h.peel_to_tree().ok());
     match source {
         DiffSource::Commit(id) => {
@@ -333,7 +367,13 @@ pub fn file_versions(repo: &Repository, source: &DiffSource, path: &str) -> (Opt
         }
         DiffSource::Staged => (blob(head()), index()),
         DiffSource::Unstaged => {
-            let work = repo.workdir().and_then(|w| std::fs::read(w.join(p)).ok());
+            let file = repo.workdir().map(|w| w.join(p));
+            // The file itself, never what a symlink points to (`/dev/zero` reports a size of 0).
+            let fits = file
+                .as_ref()
+                .and_then(|f| std::fs::symlink_metadata(f).ok())
+                .is_some_and(|m| m.is_file() && m.len() <= MAX_HIGHLIGHT_BYTES as u64);
+            let work = file.filter(|_| fits).and_then(|f| std::fs::read(f).ok());
             (index(), work.map(|b| String::from_utf8_lossy(&b).into_owned()))
         }
     }
@@ -366,6 +406,11 @@ pub fn rebase_range(repo: &Repository, from: Oid) -> Result<(Option<Oid>, Vec<(O
     Ok((base, out))
 }
 
+/// HEAD no longer points where it did (commit made meanwhile in a terminal or an editor).
+pub fn head_moved(git_dir: &std::path::Path, expected: Oid) -> bool {
+    Repository::open(git_dir).ok().and_then(|r| r.head().ok()?.target()) != Some(expected)
+}
+
 fn commit_diff<'r>(repo: &'r Repository, id: Oid, opts: &mut DiffOptions) -> Result<Diff<'r>, git2::Error> {
     let c = repo.find_commit(id)?;
     let parent_tree = c.parent(0).ok().map(|p| p.tree()).transpose()?;
@@ -386,8 +431,28 @@ pub fn fingerprint(repo: &Repository) -> u64 {
     if let Ok(head) = repo.find_reference("HEAD") {
         (head.target(), head.symbolic_target_bytes()).hash(&mut h);
     }
+    // Stashes live in the reflog of refs/stash: dropping stash@{1} leaves the ref itself unchanged,
+    // yet shifts every stash index the sidebar shows.
+    if let Ok(log) = repo.reflog("refs/stash") {
+        log.iter().for_each(|e| e.id_new().hash(&mut h));
+    }
     (repo.state() as u32).hash(&mut h);
     h.finish()
+}
+
+impl Details {
+    /// What the panel shows for a commit that can't be read.
+    pub fn unreadable(id: Oid, error: &str) -> Self {
+        Details {
+            id: id.to_string(),
+            message: format!("Impossible de lire ce commit\n{error}"),
+            author: String::new(),
+            email: String::new(),
+            date: String::new(),
+            parents: vec![],
+            files: vec![],
+        }
+    }
 }
 
 pub fn details(repo: &Repository, id: Oid) -> Result<Details, git2::Error> {
@@ -454,7 +519,8 @@ mod tests {
         git(&dir, &["switch", "-q", "main"]);
         std::fs::write(dir.join("k"), "main\n").unwrap();
         git(&dir, &["commit", "-qam", "main"]);
-        assert!(crate::git::run(&dir, &["merge", "x"]).is_err());
+        // With an identity: on machines without one, git stops before even trying to merge.
+        assert!(crate::git::run(&dir, &["-c", "user.name=t", "-c", "user.email=t@t", "merge", "x"]).is_err());
         // Then every other kind of change.
         std::fs::write(dir.join("a"), "2\n").unwrap(); // modified, not staged
         std::fs::write(dir.join("b"), "2\n").unwrap(); // modified and staged
@@ -506,8 +572,125 @@ mod tests {
         std::fs::write(dir.join("f"), "3").unwrap();
         git(&dir, &["stash", "-q"]);
         moved("stash");
+        std::fs::write(dir.join("f"), "4").unwrap();
+        git(&dir, &["stash", "-q"]);
+        moved("second stash");
+        git(&dir, &["stash", "drop", "-q", "stash@{1}"]);
+        moved("drop of an older stash");
         git(&dir, &["switch", "-q", "--detach", "HEAD~1"]);
         moved("checkout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latin1_files_are_never_patched_line_by_line() {
+        let dir = temp("latin1");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("f.txt"), b"a\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
+        std::fs::write(dir.join("f.txt"), b"a\ncaf\xe9\n").unwrap();
+        std::fs::write(dir.join("g.txt"), b"x\n").unwrap();
+        let repo = Repository::open(&dir).unwrap();
+        let (_, partial) = file_diff(&repo, &DiffSource::Unstaged, "f.txt").unwrap();
+        assert!(!partial, "a line patch would turn \\xe9 into U+FFFD");
+        // Staging the whole file keeps the exact bytes.
+        git(&dir, &["add", "--", "f.txt"]);
+        assert_eq!(std::process::Command::new("git").current_dir(&dir).args(["show", ":f.txt"]).output().unwrap().stdout, b"a\ncaf\xe9\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conflicted_file_shows_its_markers() {
+        let dir = temp("conflict-view");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("k"), "a\nb\nc\n").unwrap();
+        git(&dir, &["add", "k"]);
+        git(&dir, &["commit", "-qm", "i"]);
+        git(&dir, &["switch", "-qc", "x"]);
+        std::fs::write(dir.join("k"), "a\nX\nc\n").unwrap();
+        git(&dir, &["commit", "-qam", "x"]);
+        git(&dir, &["switch", "-q", "main"]);
+        std::fs::write(dir.join("k"), "a\nM\nc\n").unwrap();
+        git(&dir, &["commit", "-qam", "m"]);
+        assert!(crate::git::run(&dir, &["-c", "user.name=t", "-c", "user.email=t@t", "merge", "x"]).is_err());
+        let (lines, selectable) = file_diff(&Repository::open(&dir).unwrap(), &DiffSource::Unstaged, "k").unwrap();
+        assert!(!selectable);
+        assert_eq!(lines.iter().filter(|l| l.kind == LineKind::Marker).count(), 3);
+        assert!(lines.iter().any(|l| l.kind == LineKind::Context && l.text == "M"));
+        assert!(lines.iter().any(|l| l.kind == LineKind::Context && l.text == "X"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parents_always_come_after_children() {
+        let dir = temp("skew");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        // c2's clock was behind: it claims to be older than its parent c1.
+        let dated = |msg: &str, date: &str| {
+            let env = [("GIT_COMMITTER_DATE", date), ("GIT_AUTHOR_DATE", date), ("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")];
+            let env: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            crate::git::exec(&dir, &["commit", "-q", "--allow-empty", "-m", msg], None, None, &env).unwrap();
+        };
+        dated("c0", "2020-01-01T00:00:00");
+        dated("c1", "2022-01-01T00:00:00");
+        dated("c2", "2021-01-01T00:00:00");
+        git(&dir, &["switch", "-qc", "side", "HEAD~2"]);
+        dated("s1", "2023-01-01T00:00:00");
+        let h = load(&mut Repository::open(&dir).unwrap()).unwrap();
+        let pos: HashMap<Oid, usize> = h.commits.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
+        let repo = Repository::open(&dir).unwrap();
+        for c in &h.commits {
+            for p in repo.find_commit(c.id).unwrap().parent_ids() {
+                assert!(pos[&p] > pos[&c.id], "{} listed after its parent", c.summary);
+            }
+        }
+        assert_eq!(h.commits.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn head_moved_sees_new_commits() {
+        let dir = temp("head-moved");
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["commit", "-q", "--allow-empty", "-m", "c1"]);
+        let open = || Repository::open(&dir).unwrap();
+        let head = open().head().unwrap().target().unwrap();
+        assert!(!head_moved(open().path(), head));
+        git(&dir, &["commit", "-q", "--allow-empty", "-m", "c2"]);
+        assert!(head_moved(open().path(), head));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_not_followed_for_colors() {
+        let dir = temp("symlink");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("cible.rs"), "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(dir.join("cible.rs"), dir.join("lien.rs")).unwrap();
+        let repo = Repository::open(&dir).unwrap();
+        assert_eq!(file_versions(&repo, &DiffSource::Unstaged, "lien.rs").1, None);
+        assert!(file_versions(&repo, &DiffSource::Unstaged, "cible.rs").1.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn big_files_are_not_read_for_colors() {
+        let dir = temp("big-file");
+        git(&dir, &["init", "-q"]);
+        let big = "x".repeat(MAX_HIGHLIGHT_BYTES + 1);
+        std::fs::write(dir.join("big.rs"), &big).unwrap();
+        std::fs::write(dir.join("small.rs"), "fn main() {}").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
+        std::fs::write(dir.join("big.rs"), format!("{big}y")).unwrap();
+        std::fs::write(dir.join("small.rs"), "fn main() { 1 }").unwrap();
+        let repo = Repository::open(&dir).unwrap();
+        // Over the limit: neither the index blob nor the working file is loaded.
+        assert_eq!(file_versions(&repo, &DiffSource::Unstaged, "big.rs"), (None, None));
+        let (old, new) = file_versions(&repo, &DiffSource::Unstaged, "small.rs");
+        assert_eq!((old.as_deref(), new.as_deref()), (Some("fn main() {}"), Some("fn main() { 1 }")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

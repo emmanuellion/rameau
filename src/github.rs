@@ -35,10 +35,26 @@ pub struct DeviceCode {
 pub struct Account {
     pub login: String,
     pub token: String,
+    /// Public profile name, when set: suggested as git `user.name`.
+    pub name: Option<String>,
+    /// GitHub's private "noreply" address: suggested as git `user.email`.
+    pub noreply_email: String,
+}
+
+/// HTTP client with a time limit: ureq waits forever by default, and a Wi-Fi portal that
+/// accepts connections but never answers would leave the sign-in stuck.
+fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder().timeout_global(Some(timeout)).build().into()
+}
+
+fn http() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| agent(Duration::from_secs(30)))
 }
 
 fn post(url: &str, form: &[(&str, &str)]) -> Result<Value, String> {
-    ureq::post(url)
+    http()
+        .post(url)
         .header("Accept", "application/json")
         .send_form(form.iter().copied())
         .map_err(|e| format!("GitHub injoignable : {e}"))?
@@ -112,15 +128,29 @@ fn poll_step(response: Result<Value, String>, interval: u64) -> Poll {
 }
 
 fn account(token: String) -> Result<Account, String> {
-    let v: Value = ureq::get("https://api.github.com/user")
+    fetch_account("https://api.github.com/user", token).map_err(|(_, e)| e)
+}
+
+/// The account a token belongs to. The bool of the error tells whether GitHub refused the token
+/// (revoked, expired) rather than not being reachable.
+fn fetch_account(url: &str, token: String) -> Result<Account, (bool, String)> {
+    let v: Value = http()
+        .get(url)
         .header("Authorization", &format!("Bearer {token}"))
         .header("User-Agent", "rameau")
         .call()
-        .map_err(|e| format!("Token GitHub refusé : {e}"))?
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(401 | 403) => (true, "Token GitHub refusé.".to_owned()),
+            e => (false, format!("GitHub injoignable : {e}")),
+        })?
         .body_mut()
         .read_json()
-        .map_err(|e| e.to_string())?;
-    Ok(Account { login: str_field(&v, "login")?, token })
+        .map_err(|e| (false, e.to_string()))?;
+    let str_field = |k| str_field(&v, k).map_err(|e| (false, e));
+    let login = str_field("login")?;
+    let noreply_email = format!("{}+{login}@users.noreply.github.com", v["id"].as_u64().unwrap_or_default());
+    let name = v["name"].as_str().filter(|n| !n.trim().is_empty()).map(str::to_owned);
+    Ok(Account { login, token, name, noreply_email })
 }
 
 /// `git credential <action>` through the user's helper (Keychain, Credential Manager, libsecret…).
@@ -142,15 +172,24 @@ fn credential(action: &str, input: &str) -> Result<String, String> {
     git::exec(&home, &args, Some(input), None, &quiet)
 }
 
-pub fn save(account: &Account) -> Result<(), String> {
-    credential("approve", &entry(Some(&account.token))).map(|_| ())
+pub fn save(token: &str) -> Result<(), String> {
+    credential("approve", &entry(Some(token))).map(|_| ())
 }
 
-/// Account previously stored by the credential helper, if its token still works.
+/// Account previously stored by the credential helper, if GitHub hasn't refused its token.
+/// Offline (train, plane), the token is kept: only the profile details are missing until next time.
 pub fn load() -> Option<Account> {
     let out = credential("fill", &entry(None)).ok()?;
-    let token = out.lines().find_map(|l| l.strip_prefix("password="))?;
-    account(token.to_owned()).ok()
+    let token = out.lines().find_map(|l| l.strip_prefix("password="))?.to_owned();
+    stored_account("https://api.github.com/user", token)
+}
+
+fn stored_account(url: &str, token: String) -> Option<Account> {
+    match fetch_account(url, token.clone()) {
+        Ok(a) => Some(a),
+        Err((true, _)) => None,
+        Err((false, _)) => Some(Account { login: "GitHub".into(), token, name: None, noreply_email: String::new() }),
+    }
 }
 
 pub fn forget() {
@@ -160,6 +199,35 @@ pub fn forget() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_server_times_out() {
+        // Accepts the connection, never answers (like a captive Wi-Fi portal).
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.local_addr().unwrap());
+        let start = Instant::now();
+        assert!(agent(Duration::from_millis(500)).get(&url).call().is_err());
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+        drop(server);
+    }
+
+    #[test]
+    fn offline_start_keeps_the_stored_token() {
+        // Nothing listens on this port: no network.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let a = stored_account(&format!("http://127.0.0.1:{port}/user"), "t0k".into()).expect("kept offline");
+        assert_eq!(a.token, "t0k");
+        // GitHub answers 401: the token was revoked, the account is dropped.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/user", server.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut s, _) = server.accept().unwrap();
+            let _ = s.read(&mut [0; 1024]);
+            let _ = s.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        assert!(stored_account(&url, "t0k".into()).is_none());
+    }
 
     #[test]
     fn polling_survives_network_errors() {

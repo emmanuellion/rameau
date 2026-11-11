@@ -23,6 +23,7 @@ jobs:
           - { target: linux-aarch64, os: ubuntu-22.04-arm, arch: aarch64 }
           - { target: windows-x86_64, os: windows-latest }
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -45,6 +46,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: scripts/linux-deps.sh
+
+      # Nothing is packaged, let alone published, from code whose tests fail on that system.
+      - name: Tests
+        run: cargo test --release --locked
+
       - name: Build macOS (Apple Silicon + Intel)
         if: runner.os == 'macOS'
         run: |
@@ -58,7 +67,6 @@ jobs:
       - name: Build Linux
         if: runner.os == 'Linux'
         run: |
-          scripts/linux-deps.sh
           cargo build --release --locked
           scripts/package-linux.sh target/release/rameau "$VERSION" "${{ matrix.arch }}" dist
 
@@ -85,6 +93,7 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:

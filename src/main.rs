@@ -23,6 +23,7 @@ use app::{CloseDiff, Rameau, SelectNext, SelectPrev};
 use config::Config;
 
 fn main() {
+    git::load_shell_path();
     let mut config = Config::load();
     // `rameau <path>` opens (and imports) that project.
     let open = std::env::args().nth(1).map(|arg| match Repository::discover(&arg) {

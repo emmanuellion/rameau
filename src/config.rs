@@ -40,7 +40,14 @@ impl Config {
     }
 
     fn load_from(path: &Path) -> Self {
-        std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        let Ok(bytes) = std::fs::read(path) else { return Self::default() };
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            // Hand-edited with a typo, or written by another version: keep it aside instead of
+            // letting the next save replace the project list with an empty one.
+            eprintln!("rameau: configuration illisible ({e}), mise de côté en config.json.bak");
+            let _ = std::fs::rename(path, path.with_extension("json.bak"));
+            Self::default()
+        })
     }
 
     pub fn save(&self) {
@@ -103,6 +110,21 @@ mod tests {
         let canon = |p: &Path| crate::app::canonical(p).unwrap();
         assert_eq!(config.projects, [canon(&a), canon(&b)]);
         assert_eq!(config.last, Some(canon(&a)), "a deleted last project falls back to the first one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_config_is_kept_aside() {
+        let dir = crate::app::tests::temp("config-bad");
+        let path = dir.join("config.json");
+        let text = "{\"projects\": [\"/projets/a\",], }";
+        std::fs::write(&path, text).unwrap();
+        let config = Config::load_from(&path);
+        assert!(config.projects.is_empty());
+        assert_eq!(std::fs::read_to_string(path.with_extension("json.bak")).unwrap(), text, "the user's list is still there");
+        // A missing file is just a first launch: nothing to keep aside.
+        let _ = Config::load_from(&dir.join("absent.json"));
+        assert!(!dir.join("absent.json.bak").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

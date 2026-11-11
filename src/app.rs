@@ -9,7 +9,7 @@ use std::rc::Rc;
 use git2::{Oid, Repository};
 use gpui::{
     ClipboardItem, Context, Entity, FocusHandle, HighlightStyle, PathPromptOptions, ScrollStrategy, SharedString,
-    Subscription, Task, UniformListScrollHandle, Window, actions, prelude::*, px,
+    Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px,
 };
 use gpui_component::{
     WindowExt,
@@ -91,6 +91,13 @@ pub enum LineOp {
     Discard,
 }
 
+impl LineOp {
+    /// Unstage and Discard apply the patch with `--reverse`: it must be built for that direction.
+    pub fn reversed(self) -> bool {
+        self != LineOp::Stage
+    }
+}
+
 type After = Box<dyn FnOnce(&mut Rameau, &mut Window, &mut Context<Rameau>)>;
 
 /// A git command to run in the background.
@@ -104,6 +111,9 @@ pub struct GitJob {
     after: Option<After>,
     /// Only the working copy changes (staging, discarding): refresh the file lists, not the history.
     status_only: bool,
+    /// Talks to a server: only these jobs get the GitHub token. Git hooks (pre-commit…) run
+    /// with the job's environment, and a cloned project's hooks must not see the token.
+    network: bool,
 }
 
 impl GitJob {
@@ -112,7 +122,7 @@ impl GitJob {
     }
 
     pub fn owned(what: &'static str, args: Vec<String>) -> Self {
-        Self { what, args, dir: None, input: None, env: vec![], done: None, after: None, status_only: false }
+        Self { what, args, dir: None, input: None, env: vec![], done: None, after: None, status_only: false, network: false }
     }
 
     pub fn done(mut self, msg: &'static str) -> Self {
@@ -122,6 +132,11 @@ impl GitJob {
 
     pub fn after(mut self, f: impl FnOnce(&mut Rameau, &mut Window, &mut Context<Rameau>) + 'static) -> Self {
         self.after = Some(Box::new(f));
+        self
+    }
+
+    pub fn network(mut self) -> Self {
+        self.network = true;
         self
     }
 
@@ -305,9 +320,6 @@ impl Rameau {
                             this.page = Page::Repo;
                         }
                         this.proj = Some(Project { path, repo, history });
-                        if this.selection == Selection::Changes && this.history().is_some_and(|h| h.changes.is_empty()) {
-                            this.selection = Selection::None;
-                        }
                         this.refresh_diff(cx);
                     }
                     Err(e) => {
@@ -344,9 +356,6 @@ impl Rameau {
                     }
                     (Err(e), _) => eprintln!("rameau: {}", e.message()),
                     _ => {}
-                }
-                if this.selection == Selection::Changes && this.history().is_some_and(|h| h.changes.is_empty()) {
-                    this.selection = Selection::None;
                 }
                 this.refresh_diff(cx);
                 cx.notify();
@@ -399,7 +408,8 @@ impl Rameau {
         self.selection = Selection::Commit(id);
         self.close_diff();
         let Some(p) = &self.proj else { return };
-        self.details = repo::details(&p.repo, id).inspect_err(|e| eprintln!("rameau: {e}")).ok();
+        // An unreadable commit (partial clone, broken object) says so in the panel.
+        self.details = Some(repo::details(&p.repo, id).unwrap_or_else(|e| repo::Details::unreadable(id, e.message())));
         cx.notify();
     }
 
@@ -434,7 +444,11 @@ impl Rameau {
         let Some(git_dir) = self.proj.as_ref().map(|p| p.repo.path().to_owned()) else { return };
         let task = cx.background_executor().spawn(async move {
             let repo = Repository::open(&git_dir)?;
-            let (lines, partial) = repo::file_diff(&repo, &source, &path)?;
+            let (lines, partial) = match repo::file_diff(&repo, &source, &path) {
+                Ok(diff) => diff,
+                // Shown in the diff view: the click must not look ignored.
+                Err(e) => (vec![repo::DiffLine::info(&format!("Impossible d'afficher ce fichier : {}", e.message()))], false),
+            };
             let highlights = diff_view::highlight(&repo, &source, &path, &lines);
             let longest = lines.iter().enumerate().max_by_key(|(_, l)| l.text.len()).map_or(0, |(i, _)| i);
             let selectable = partial && !matches!(source, DiffSource::Commit(_));
@@ -476,7 +490,11 @@ impl Rameau {
 
     /// After a reload, keep the open working-copy diff in sync: it follows the file
     /// from "unstaged" to "staged" (and back), and closes when the file is clean.
+    /// Also closes the changes panel once nothing is left to commit.
     pub fn refresh_diff(&mut self, cx: &mut Context<Self>) {
+        if self.selection == Selection::Changes && self.history().is_some_and(|h| h.changes.is_empty()) {
+            self.selection = Selection::None;
+        }
         let Some(d) = &self.diff else { return };
         let Some(ch) = self.history().map(|h| &h.changes) else { return };
         let listed = |l: &[(char, String)]| l.iter().any(|(_, p)| *p == d.path);
@@ -509,7 +527,7 @@ impl Rameau {
         let Some(dir) = job.dir.clone().or_else(|| self.dir()) else { return };
         self.busy = Some(format!("{}…", job.what).into());
         cx.notify();
-        let token = self.token();
+        let token = if job.network { self.token() } else { None };
         let GitJob { what, args, input, env, done, after, status_only, .. } = job;
         let task = cx.background_executor().spawn(async move {
             let a: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -574,14 +592,51 @@ impl Rameau {
             self.message.update(cx, |s, cx| s.focus(window, cx));
             return;
         }
+        // A fresh Git (Windows, Linux) has no author: git would refuse the commit in English.
+        let signed = self.proj.as_ref().is_some_and(|p| Repository::open(p.repo.path()).and_then(|r| r.signature()).is_ok());
+        if !signed {
+            return self.identity_dialog(window, cx);
+        }
         let job = GitJob::owned("Commit", vec!["commit".into(), "-m".into(), msg])
             .after(|this, window, cx| this.message.update(cx, |s, cx| s.set_value("", window, cx)));
         self.run(job, window, cx);
     }
 
+    /// Asks the name and e-mail that sign commits, saves them in the user's git config, then commits.
+    fn identity_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (name0, email0) = identity_suggestion(&self.login);
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("Prénom Nom").default_value(name0));
+        let email = cx.new(|cx| InputState::new(window, cx).placeholder("toi@exemple.com").default_value(email0));
+        let (weak, focus) = (cx.weak_entity(), name.clone());
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (name, email, weak) = (name.clone(), email.clone(), weak.clone());
+            let p = theme::pal();
+            let body = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(div().text_sm().text_color(theme::c(p.muted)).child(
+                    "Git signe chaque commit avec un nom et une adresse e-mail, visibles dans l'historique. \
+                     Ils sont enregistrés une fois pour tous tes projets.",
+                ))
+                .child(Input::new(&name))
+                .child(Input::new(&email));
+            ui::with_footer(dialog.title("Qui signe les commits ?").child(body), "Enregistrer et committer", false, move |window, cx| {
+                let (n, e) = (name.read(cx).value().trim().to_owned(), email.read(cx).value().trim().to_owned());
+                if let Err(msg) = save_identity(&n, &e, &[]) {
+                    window.push_notification(Notification::warning(msg), cx);
+                    return false;
+                }
+                weak.update(cx, |this, cx| this.commit(window, cx)).ok();
+                true
+            })
+        });
+        cx.defer_in(window, move |_, window, cx| focus.update(cx, |s, cx| s.focus(window, cx)));
+    }
+
     pub fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = &self.proj else { return };
-        self.run(GitJob::new("Pull", &pull_args(&p.repo)).done("Pull terminé"), window, cx);
+        self.run(GitJob::new("Pull", &pull_args(&p.repo)).network().done("Pull terminé"), window, cx);
     }
 
     pub fn push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -592,7 +647,7 @@ impl Rameau {
             // First push of this branch: publish it and set its upstream.
             GitJob::new("Push", &["push", "-u", &push_remote(&p.repo), "HEAD"])
         };
-        self.run(job.done("Push terminé"), window, cx);
+        self.run(job.network().done("Push terminé"), window, cx);
     }
 
     /// Stages, unstages or discards the selected lines of the open diff (or one hunk).
@@ -603,7 +658,7 @@ impl Rameau {
             (Some(h), Some(end)) => i > h && i < end,
             _ => d.selected.contains(&i),
         };
-        let Some(patch) = patch::build(&d.path, &d.lines, selected, op == LineOp::Unstage) else { return };
+        let Some(patch) = patch::build(&d.path, &d.lines, selected, op.reversed()) else { return };
         let (what, args): (&'static str, &[&str]) = match op {
             LineOp::Stage => ("Ajout des lignes", &["apply", "--cached", "--recount", "-"]),
             LineOp::Unstage => ("Retrait des lignes", &["apply", "--cached", "--recount", "--reverse", "-"]),
@@ -624,10 +679,10 @@ impl Rameau {
 
     pub fn discard_file(&mut self, path: String, untracked: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (job, msg) = if untracked {
-            (GitJob::owned("Suppression", vec!["clean".into(), "-f".into(), "--".into(), path.clone()]).status_only(), format!("Le nouveau fichier {path} sera supprimé."))
+            (GitJob::owned("Suppression", vec!["clean".into(), "-f".into(), "--".into(), git::literal(&path)]).status_only(), format!("Le nouveau fichier {path} sera supprimé."))
         } else {
             (
-                GitJob::owned("Annulation", vec!["restore".into(), "--".into(), path.clone()]).status_only(),
+                GitJob::owned("Annulation", vec!["restore".into(), "--".into(), git::literal(&path)]).status_only(),
                 format!("Les modifications non indexées de {path} seront perdues définitivement."),
             )
         };
@@ -638,7 +693,7 @@ impl Rameau {
         let Some(p) = &self.proj else { return };
         if kind == RefKind::Remote {
             let Some((remote, branch)) = name.split_once('/') else { return };
-            let job = GitJob::new("Suppression de la branche distante", &["push", remote, "--delete", branch]);
+            let job = GitJob::new("Suppression de la branche distante", &["push", remote, "--delete", branch]).network();
             let msg = format!("La branche {branch} sera supprimée du serveur {remote}, pour tout le monde.");
             self.confirm(format!("Supprimer {name} ?"), msg, "Supprimer sur le serveur", job, window, cx);
             return;
@@ -688,10 +743,22 @@ impl Rameau {
         };
         let editor = cx.new(|_| RebaseEditor::new(base, commits));
         let weak = cx.weak_entity();
+        // The list is fixed now: a commit made before "Lancer" would be missing from it, and git drops
+        // commits missing from the list.
+        let (git_dir, head) = (p.repo.path().to_owned(), p.repo.head().ok().and_then(|h| h.target()));
         window.open_dialog(cx, move |dialog, _, _| {
             let (editor, weak) = (editor.clone(), weak.clone());
             let dialog = dialog.title("Rebase interactif").w(px(760.)).child(editor.clone());
-            ui::with_footer(dialog, "Lancer le rebase", false, move |window, cx| match editor.read(cx).plan(&std::env::temp_dir(), cx) {
+            let git_dir = git_dir.clone();
+            ui::with_footer(dialog, "Lancer le rebase", false, move |window, cx| {
+                if head.is_none_or(|h| repo::head_moved(&git_dir, h)) {
+                    let msg = "Un commit a été fait pendant que cette fenêtre était ouverte. Ferme-la et relance le rebase interactif.";
+                    window.push_notification(Notification::warning(msg).title("L'historique a changé"), cx);
+                    return false;
+                }
+                // Written in the project's .git folder, the user's own: a shared temp folder lets
+                // another account on the machine plant a file there first.
+                match editor.read(cx).plan(&git_dir, cx) {
                 Err(e) => {
                     window.push_notification(Notification::error(e), cx);
                     false
@@ -700,20 +767,20 @@ impl Rameau {
                     weak.update(cx, |this, cx| this.run_rebase(base, todo, window, cx)).ok();
                     true
                 }
+                }
             })
         });
     }
 
     fn run_rebase(&mut self, base: Option<Oid>, todo: String, window: &mut Window, cx: &mut Context<Self>) {
-        let file = std::env::temp_dir().join(format!("rameau-todo-{}.txt", std::process::id()));
+        let Some(git_dir) = self.proj.as_ref().map(|p| p.repo.path().to_owned()) else { return };
+        let file = git_dir.join("rameau-todo.txt");
         if let Err(e) = std::fs::write(&file, todo) {
             return self.notify_error("Rebase interactif", e.to_string(), window, cx);
         }
-        let mut args = vec!["rebase".to_owned(), "-i".into(), "--autostash".into()];
-        args.push(base.map_or("--root".into(), |b| b.to_string()));
+        let (args, env) = crate::rebase::command(base, &file);
         let mut job = GitJob::owned("Rebase interactif", args).done("Rebase terminé");
-        // git calls the "editor" with the todo path: we just copy our list over it.
-        job.env.push(("GIT_SEQUENCE_EDITOR".into(), format!("cp '{}'", file.display())));
+        job.env = env;
         self.run(job, window, cx);
     }
 
@@ -739,20 +806,21 @@ impl Rameau {
                 cx.notify();
             })
             .ok();
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let account = github::wait_for_token(client_id, &code)?;
-                    // Not fatal: the login then just lasts for this session.
-                    if let Err(e) = github::save(&account) {
-                        eprintln!("rameau: token non enregistré : {e}");
-                    }
-                    Ok::<_, String>(account)
-                })
-                .await;
+            let result = cx.background_executor().spawn(async move { github::wait_for_token(client_id, &code) }).await;
+            // Reached only if the sign-in wasn't cancelled meanwhile ("Annuler" drops this task):
+            // a token approved in the browser after cancelling is never stored.
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(a) => {
+                        let token = a.token.clone();
+                        cx.background_executor()
+                            .spawn(async move {
+                                // Not fatal: the sign-in then just lasts for this session.
+                                if let Err(e) = github::save(&token) {
+                                    eprintln!("rameau: token non enregistré : {e}");
+                                }
+                            })
+                            .detach();
                         window.push_notification(Notification::success(format!("Connecté en tant que {}", a.login)), cx);
                         this.login = Login::In(a);
                     }
@@ -908,7 +976,8 @@ impl Rameau {
             return window.push_notification(Notification::warning(msg), cx);
         }
         let d = dest.clone();
-        let job = GitJob::owned("Clonage", vec!["clone".into(), url, dest.display().to_string()])
+        let job = GitJob::owned("Clonage", clone_args(&url, &dest))
+            .network()
             .dir(self.clone_parent.clone())
             .done("Dépôt cloné")
             .after(move |this, window, cx| {
@@ -938,6 +1007,29 @@ pub fn fit_widths(viewport: f32, (mut sidebar, mut panel): (f32, f32)) -> (f32, 
         sidebar -= (over - from_panel).min(sidebar - SIDEBAR_RANGE.0).max(0.);
     }
     (sidebar, panel)
+}
+
+/// Name and e-mail suggested to sign commits, from the GitHub account. Nothing when the account
+/// couldn't be checked (offline start: its login is only a placeholder).
+fn identity_suggestion(login: &Login) -> (String, String) {
+    match login {
+        Login::In(a) if !a.noreply_email.is_empty() => (a.name.clone().unwrap_or_else(|| a.login.clone()), a.noreply_email.clone()),
+        _ => (String::new(), String::new()),
+    }
+}
+
+/// Saves the commit author in the user's global git config (`env` lets tests aim at a temp file).
+pub fn save_identity(name: &str, email: &str, env: &[(String, String)]) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Indique ton nom.".into());
+    }
+    if !email.contains('@') || email.contains(char::is_whitespace) {
+        return Err("Indique une adresse e-mail valide.".into());
+    }
+    for (key, value) in [("user.name", name), ("user.email", email)] {
+        git::exec(&config::home(), &["config", "--global", key, value], None, None, env)?;
+    }
+    Ok(())
 }
 
 /// Where a new branch gets published, like git decides: `remote.pushDefault`, else `origin`,
@@ -989,6 +1081,22 @@ fn strip_verbatim(s: &str) -> Option<String> {
     })
 }
 
+/// Checkout of a branch. A remote one (`upstream/feature`) goes to the local branch of that name
+/// if there is one, else creates it tracking exactly that remote: a plain `git switch feature`
+/// fails as soon as two remotes have a `feature`.
+pub fn checkout_args(name: &str, remote: bool, locals: &[&str]) -> Vec<String> {
+    let local = name.split_once('/').map_or(name, |(_, b)| b);
+    match remote && !locals.contains(&local) {
+        true => vec!["switch".into(), "--track".into(), name.into()],
+        false => vec!["switch".into(), if remote { local } else { name }.into()],
+    }
+}
+
+/// `--` first: whatever was pasted is taken as an address, never as a git option.
+pub fn clone_args(url: &str, dest: &std::path::Path) -> Vec<String> {
+    vec!["clone".into(), "--".into(), url.into(), dest.display().to_string()]
+}
+
 /// Folder name `git clone` would pick: `https://github.com/a/b.git` and `git@github.com:a/b` give `b`.
 pub fn repo_name(url: &str) -> Option<&str> {
     let url = url.trim().trim_end_matches('/');
@@ -998,6 +1106,7 @@ pub fn repo_name(url: &str) -> Option<&str> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::GitJob;
     use std::path::Path;
 
     /// Temp folder unique to this test run.
@@ -1037,7 +1146,9 @@ pub(crate) mod tests {
 
         let repo = git2::Repository::open(&a).unwrap();
         let args = super::pull_args(&repo);
-        assert!(args.contains(&"--no-rebase"));
+        // Git for Windows sets pull.rebase at install: then the user's choice applies.
+        let preset = repo.config().unwrap().get_string("pull.rebase").is_ok();
+        assert_eq!(args.contains(&"--no-rebase"), !preset);
         git(&a, &args);
         assert!(a.join("g").exists() && a.join("h").exists());
 
@@ -1103,6 +1214,99 @@ pub(crate) mod tests {
         assert_eq!(super::strip_verbatim(r"\\?\UNC\nas\code\p").as_deref(), Some(r"\\nas\code\p"));
         assert_eq!(super::strip_verbatim(r"C:\dev"), None);
         assert_eq!(super::strip_verbatim("/Users/x"), None);
+    }
+
+    #[test]
+    fn offline_account_suggests_no_identity() {
+        use super::{Login, identity_suggestion};
+        use crate::github::Account;
+        let account = |name: Option<&str>, email: &str| {
+            Login::In(Account { login: "ada".into(), token: "t".into(), name: name.map(Into::into), noreply_email: email.into() })
+        };
+        let checked = account(Some("Ada Lovelace"), "1+ada@users.noreply.github.com");
+        assert_eq!(identity_suggestion(&checked), ("Ada Lovelace".into(), "1+ada@users.noreply.github.com".into()));
+        // Started offline: the account was kept, but nothing about it is known yet.
+        let offline = Login::In(Account { login: "GitHub".into(), token: "t".into(), name: None, noreply_email: String::new() });
+        assert_eq!(identity_suggestion(&offline), (String::new(), String::new()));
+        assert_eq!(identity_suggestion(&Login::Out), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn identity_is_checked_and_saved() {
+        let dir = temp("identity");
+        let file = dir.join("gitconfig");
+        let env = [("GIT_CONFIG_GLOBAL".to_owned(), file.display().to_string())];
+        assert!(super::save_identity("", "a@b.c", &env).is_err());
+        assert!(super::save_identity("Ada", "pas-une-adresse", &env).is_err());
+        super::save_identity("Ada Lovelace", "ada@example.com", &env).unwrap();
+        let get = |key: &str| crate::git::exec(&dir, &["config", "--global", key], None, None, &env).unwrap();
+        assert_eq!((get("user.name"), get("user.email")), ("Ada Lovelace".into(), "ada@example.com".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hooks_see_the_token_only_when_given() {
+        let dir = temp("hook-token");
+        git(&dir, &["init", "-q"]);
+        // A pre-commit hook writing out whatever token it can see.
+        let leak = dir.join("leak");
+        let hook = dir.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, format!("#!/bin/sh\nprintf '%s' \"$RAMEAU_TOKEN\" > '{}'\n", leak.display())).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let commit = |token| {
+            let args = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"];
+            crate::git::exec(&dir, &args, None, token, &[]).unwrap();
+            std::fs::read_to_string(&leak).unwrap()
+        };
+        // What run() passes to a commit: no token, nothing to read.
+        assert!(!GitJob::new("Commit", &["commit"]).network);
+        assert_eq!(commit(None), "");
+        // Why: given a token, any hook reads it.
+        assert_eq!(commit(Some("s3cret")), "s3cret");
+        assert!(GitJob::new("Push", &["push"]).network().network);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pasted_options_are_not_run() {
+        let dir = temp("clone-opt");
+        let marker = dir.join("ran");
+        // A pasted "address" that is really an option running a command.
+        let url = format!("--upload-pack=touch '{}'", marker.display());
+        git(&dir, &["init", "-q", "--bare", "src.git"]);
+        let args = super::clone_args(&url, &dir.join("src.git"));
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert!(crate::git::run(&dir, &a).is_err(), "taken as an address, it doesn't exist");
+        assert!(!marker.exists(), "the pasted command must not run");
+        // A normal address still clones.
+        let src = dir.join("src.git").display().to_string();
+        let args = super::clone_args(&src, &dir.join("copie"));
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::git::run(&dir, &a).unwrap();
+        assert!(dir.join("copie/.git").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkout_of_a_branch_present_on_two_remotes() {
+        let root = temp("two-remotes");
+        git(&root, &["init", "-q", "-b", "main", "up"]);
+        let up = root.join("up");
+        git(&up, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&up, &["branch", "feature"]);
+        git(&root, &["clone", "-q", "up", "work"]);
+        let work = root.join("work");
+        git(&work, &["remote", "add", "upstream", "../up"]);
+        git(&work, &["fetch", "-q", "upstream"]);
+        let args = super::checkout_args("upstream/feature", true, &["main"]);
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        git(&work, &a);
+        assert_eq!(git(&work, &["rev-parse", "--abbrev-ref", "@{upstream}"]), "upstream/feature");
+        // Once the local branch exists, it is simply switched to.
+        assert_eq!(super::checkout_args("origin/feature", true, &["main", "feature"]), ["switch", "feature"]);
+        assert_eq!(super::checkout_args("main", false, &["main"]), ["switch", "main"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -2,10 +2,10 @@
 
 use git2::RepositoryState;
 use gpui::{
-    Animation, AnimationExt, MouseMoveEvent, deferred, ease_out_quint, percentage, radians,
+    Animation, AnimationExt, MouseMoveEvent, ease_out_quint, percentage, radians,
     AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, ExternalPaths, Hsla, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, PathBuilder, Pixels, Point, Render, ScrollStrategy, SharedString, Styled, WeakEntity,
-    Window, canvas, div, point, prelude::*, px, quad, size, uniform_list,
+    Window, canvas, div, point, prelude::*, px, quad, relative, size, uniform_list,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Root, Sizable, TitleBar,
@@ -16,7 +16,7 @@ use gpui_component::{
 
 use crate::app::{CloseDiff, GitJob, Login, MenuTarget, Page, Project, Rameau, SelectNext, SelectPrev, Selection, Side};
 use crate::graph::{Half, Row};
-use crate::repo::{DiffSource, RefKind, RefLabel};
+use crate::repo::{Changes, DiffSource, RefKind, RefLabel};
 use crate::theme::{alpha, c, lane_color, mono, pal, status_color};
 use crate::ui::{appear, avatar, button, button_sm, icon, icon_button, key};
 
@@ -31,8 +31,22 @@ const AUTHOR_W: f32 = 170.;
 const AVATAR_W: f32 = 44.;
 const DATE_W: f32 = 110.;
 const HASH_W: f32 = 64.;
-// shortcut: wider graphs are clipped; make the graph column resizable if repos need it.
-const MAX_GRAPH_LANES: usize = 14;
+/// Height of every line of the file lists (headers included): they are virtualized.
+const LIST_ROW_H: f32 = 34.;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FileGroup {
+    Conflicts,
+    Unstaged,
+    Staged,
+}
+
+/// A line of the changes list: group header (with its file count) or a file of a group.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ChangeItem {
+    Header(FileGroup, usize),
+    File(FileGroup, usize),
+}
 
 /// Height of every sidebar line (headers included): the list is virtualized.
 const SIDE_ROW_H: f32 = 32.;
@@ -58,6 +72,29 @@ const GROUPS: [Group; 3] = [
     Group { key: "remotes", title: "Distantes", icon: "cloud", remote: Some(true) },
     Group { key: "stashes", title: "Stashs", icon: "archive", remote: None },
 ];
+
+/// An operation git left half-done, and the commands of the banner's buttons.
+struct Operation {
+    title: &'static str,
+    /// None: nothing to continue from the app (bisect is driven from a terminal).
+    cont: Option<&'static [&'static str]>,
+    abort: &'static [&'static str],
+    abort_label: &'static str,
+}
+
+fn operation(state: RepositoryState) -> Option<Operation> {
+    use RepositoryState::*;
+    let op = |title, cont, abort| Some(Operation { title, cont: Some(cont), abort, abort_label: "Annuler l'opération" });
+    match state {
+        Clean => None,
+        Merge => op("Merge en cours", &["commit", "--no-edit"], &["merge", "--abort"]),
+        Rebase | RebaseInteractive | RebaseMerge => op("Rebase en cours", &["rebase", "--continue"], &["rebase", "--abort"]),
+        CherryPick | CherryPickSequence => op("Cherry-pick en cours", &["cherry-pick", "--continue"], &["cherry-pick", "--abort"]),
+        Revert | RevertSequence => op("Revert en cours", &["revert", "--continue"], &["revert", "--abort"]),
+        ApplyMailbox | ApplyMailboxOrRebase => op("Application de patchs en cours", &["am", "--continue"], &["am", "--abort"]),
+        Bisect => Some(Operation { title: "Bisect en cours", cont: None, abort: &["bisect", "reset"], abort_label: "Arrêter le bisect" }),
+    }
+}
 
 fn project_name(path: &std::path::Path) -> String {
     path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
@@ -175,7 +212,7 @@ impl Rameau {
                     .disabled(busy)
                     .tooltip("Récupérer les nouveautés du serveur sans toucher à tes fichiers")
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.run(GitJob::new("Fetch", &["fetch", "--all", "--prune"]), window, cx)
+                        this.run(GitJob::new("Fetch", &["fetch", "--all", "--prune"]).network(), window, cx)
                     })),
             )
             .child(
@@ -304,7 +341,7 @@ impl Rameau {
             _ => None,
         };
         // Every line is SIDE_ROW_H tall: the list only builds the visible ones.
-        let line = div().h(px(SIDE_ROW_H)).flex().flex_col().justify_end();
+        let line = div().w_full().h(px(SIDE_ROW_H)).flex().flex_col().justify_end();
         match item {
             SideItem::Header(g, count) => {
                 let group = &GROUPS[g];
@@ -466,26 +503,16 @@ impl Rameau {
     /// Banner shown while a merge/rebase/cherry-pick waits for the user.
     fn state_banner(&self, pr: &Project, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let p = pal();
-        let (title, cont, abort): (&str, &[&str], &[&str]) = match pr.history.state {
-            RepositoryState::Clean => return None,
-            RepositoryState::Merge => ("Merge en cours", &["commit", "--no-edit"], &["merge", "--abort"]),
-            RepositoryState::Rebase | RepositoryState::RebaseInteractive | RepositoryState::RebaseMerge => {
-                ("Rebase en cours", &["rebase", "--continue"], &["rebase", "--abort"])
-            }
-            RepositoryState::CherryPick | RepositoryState::CherryPickSequence => {
-                ("Cherry-pick en cours", &["cherry-pick", "--continue"], &["cherry-pick", "--abort"])
-            }
-            RepositoryState::Revert | RepositoryState::RevertSequence => ("Revert en cours", &["revert", "--continue"], &["revert", "--abort"]),
-            _ => ("Opération git en cours", &["am", "--continue"], &["am", "--abort"]),
-        };
+        let op = operation(pr.history.state)?;
         let conflicts = pr.history.changes.conflicted.len();
-        let hint = match conflicts {
-            0 => "Conflits résolus : tu peux continuer.".to_owned(),
-            1 => "1 conflit à résoudre : corrige le fichier puis coche-le.".to_owned(),
-            n => format!("{n} conflits à résoudre : corrige les fichiers puis coche-les."),
+        let hint = match (op.cont, conflicts) {
+            (None, _) => "Recherche du commit fautif lancée dans un terminal : continue-la là-bas, ou arrête-la ici.".to_owned(),
+            (Some(_), 0) => "Conflits résolus : tu peux continuer.".to_owned(),
+            (Some(_), 1) => "1 conflit à résoudre : corrige le fichier puis coche-le.".to_owned(),
+            (Some(_), n) => format!("{n} conflits à résoudre : corrige les fichiers puis coche-les."),
         };
-        let (cont, abort): (Vec<String>, Vec<String>) =
-            (cont.iter().map(|s| s.to_string()).collect(), abort.iter().map(|s| s.to_string()).collect());
+        let words = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (title, cont, abort, bisect) = (op.title, op.cont.map(words), words(op.abort), op.cont.is_none());
         Some(
             div()
                 .m_3()
@@ -508,21 +535,28 @@ impl Rameau {
                         .child(div().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).text_color(c(p.text)).child(title))
                         .child(div().text_xs().text_color(c(p.muted)).child(hint)),
                 )
-                .child(button_sm("abort-op").ghost().label("Annuler l'opération").on_click(cx.listener(
-                    move |this, _: &ClickEvent, window, cx| this.run(GitJob::owned("Annulation", abort.clone()), window, cx),
+                .child(button_sm("abort-op").ghost().label(op.abort_label).on_click(cx.listener(
+                    move |this, _: &ClickEvent, window, cx| {
+                        let msg = match bisect {
+                            true => "Le bisect s'arrête et tu reviens sur la branche de départ.",
+                            false => "Le dépôt revient à son état d'avant l'opération : les conflits déjà résolus seront perdus.",
+                        };
+                        let job = GitJob::owned("Annulation", abort.clone());
+                        this.confirm(format!("{} ?", op.abort_label), msg.to_owned(), op.abort_label, job, window, cx)
+                    },
                 )))
-                .child(
+                .children(cont.map(|cont| {
                     button_sm("continue-op")
                         .primary()
                         .label("Continuer")
                         .disabled(conflicts > 0)
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.run(GitJob::owned("Continuer", cont.clone()), window, cx))),
-                ),
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.run(GitJob::owned("Continuer", cont.clone()), window, cx)))
+                })),
         )
     }
 
     fn graph_width(pr: &Project) -> f32 {
-        pr.history.max_lanes.min(MAX_GRAPH_LANES) as f32 * LANE_W + 10.
+        pr.history.max_lanes.min(crate::graph::MAX_LANES) as f32 * LANE_W + 10.
     }
 
     fn wip_row(&self, pr: &Project, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -757,56 +791,86 @@ impl Rameau {
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_diff(source.clone(), pth.clone(), false, cx)))
     }
 
+    /// Lines of the changes list: a header per non-empty group, then its files.
+    fn change_items(ch: &Changes) -> Vec<ChangeItem> {
+        let mut items = Vec::new();
+        for (group, len) in [(FileGroup::Conflicts, ch.conflicted.len()), (FileGroup::Unstaged, ch.unstaged.len()), (FileGroup::Staged, ch.staged.len())] {
+            if len > 0 {
+                items.push(ChangeItem::Header(group, len));
+                items.extend((0..len).map(|i| ChangeItem::File(group, i)));
+            }
+        }
+        items
+    }
+
+    fn change_item(&self, ch: &Changes, item: ChangeItem, cx: &mut Context<Self>) -> AnyElement {
+        let path_args = |cmd: &[&str], path: &str| cmd.iter().map(|s| s.to_string()).chain([crate::git::literal(path)]).collect::<Vec<_>>();
+        // Every line is LIST_ROW_H tall: the list only builds the visible ones.
+        let line = div().w_full().h(px(LIST_ROW_H)).flex().flex_col().justify_end();
+        match item {
+            ChangeItem::Header(group, n) => {
+                let (title, action): (&'static str, Option<(&'static str, &'static str, &'static [&'static str])>) = match group {
+                    FileGroup::Conflicts => ("CONFLITS", None),
+                    FileGroup::Unstaged => ("NON INDEXÉS", Some(("stage-all", "Tout cocher", &["add", "-A"]))),
+                    FileGroup::Staged => ("DANS LE COMMIT", Some(("unstage-all", "Tout décocher", &["reset", "-q"]))),
+                };
+                line.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .pb_0p5()
+                        .child(label(title))
+                        .child(badge(n, false))
+                        .child(div().flex_1())
+                        .children(action.map(|(id, text, args)| {
+                            button_sm(id).ghost().label(text).on_click(
+                                cx.listener(move |this, _: &ClickEvent, window, cx| this.run(GitJob::new(text, args).status_only(), window, cx)),
+                            )
+                        })),
+                )
+                .into_any_element()
+            }
+            ChangeItem::File(FileGroup::Conflicts, i) => {
+                let path = &ch.conflicted[i];
+                let a = path_args(&["add", "--"], path);
+                line.child(self.file_row(("conflict", i), &('U', path.clone()), DiffSource::Unstaged, Some((false, a)), cx)).into_any_element()
+            }
+            ChangeItem::File(FileGroup::Unstaged, i) => {
+                let f = &ch.unstaged[i];
+                let a = path_args(&["add", "--"], &f.1);
+                let target = MenuTarget::File(f.1.clone(), f.0 == 'A');
+                line.child(
+                    self.file_row(("unstaged", i), f, DiffSource::Unstaged, Some((false, a)), cx)
+                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_target = Some(target.clone()))),
+                )
+                .into_any_element()
+            }
+            ChangeItem::File(FileGroup::Staged, i) => {
+                let f = &ch.staged[i];
+                let a = path_args(&["reset", "-q", "--"], &f.1);
+                line.child(self.file_row(("staged", i), f, DiffSource::Staged, Some((true, a)), cx)).into_any_element()
+            }
+        }
+    }
+
     fn changes_panel(&self, pr: &Project, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal();
         let ch = &pr.history.changes;
-        let header = |title: &'static str, n: usize, action: Option<(&'static str, &'static str, &'static [&'static str])>, cx: &mut Context<Self>| {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .pt_5()
-                .pb_1p5()
-                .px_2()
-                .child(label(title))
-                .child(badge(n, false))
-                .child(div().flex_1())
-                .children(action.map(|(id, text, args)| {
-                    button_sm(id)
-                        .ghost()
-                        .label(text)
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.run(GitJob::new(text, args).status_only(), window, cx)))
-                }))
-        };
-        let path_args = |cmd: &[&str], path: &str| cmd.iter().map(|s| s.to_string()).chain([path.to_owned()]).collect::<Vec<_>>();
-        let mut files = div().id("changes-files").flex_1().overflow_y_scroll().px_3().pt_4().pb_3();
-        files = files.child(div().px_2().text_lg().font_weight(gpui::FontWeight::SEMIBOLD).text_color(c(p.text)).child("Modifications locales"));
-        if !ch.conflicted.is_empty() {
-            files = files.child(header("CONFLITS", ch.conflicted.len(), None, cx));
-            for (i, path) in ch.conflicted.iter().enumerate() {
-                let entry = ('U', path.clone());
-                let a = path_args(&["add", "--"], path);
-                files = files.child(self.file_row(("conflict", i), &entry, DiffSource::Unstaged, Some((false, a)), cx));
-            }
-        }
-        if !ch.unstaged.is_empty() {
-            files = files.child(header("NON INDEXÉS", ch.unstaged.len(), Some(("stage-all", "Tout cocher", &["add", "-A"])), cx));
-            for (i, f) in ch.unstaged.iter().enumerate() {
-                let a = path_args(&["add", "--"], &f.1);
-                let target = MenuTarget::File(f.1.clone(), f.0 == 'A');
-                files = files.child(
-                    self.file_row(("unstaged", i), f, DiffSource::Unstaged, Some((false, a)), cx)
-                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_target = Some(target.clone()))),
-                );
-            }
-        }
-        if !ch.staged.is_empty() {
-            files = files.child(header("DANS LE COMMIT", ch.staged.len(), Some(("unstage-all", "Tout décocher", &["reset", "-q"])), cx));
-            for (i, f) in ch.staged.iter().enumerate() {
-                let a = path_args(&["reset", "-q", "--"], &f.1);
-                files = files.child(self.file_row(("staged", i), f, DiffSource::Staged, Some((true, a)), cx));
-            }
-        }
+        // Virtualized: a project without .gitignore can list tens of thousands of files.
+        let files = uniform_list(
+            "changes-list",
+            Self::change_items(ch).len(),
+            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                let Some(pr) = &this.proj else { return vec![] };
+                let ch = &pr.history.changes;
+                let items = Self::change_items(ch);
+                range.filter_map(|ix| items.get(ix).map(|item| this.change_item(ch, *item, cx))).collect::<Vec<_>>()
+            }),
+        )
+        .flex_1();
         let n = ch.staged.len();
         let key = if cfg!(target_os = "macos") { "⌘↩" } else { "Ctrl+↩" };
         div()
@@ -818,8 +882,9 @@ impl Rameau {
             .bg(c(p.panel))
             .border_l_1()
             .border_color(c(p.border))
+            .child(div().flex_none().px_5().pt_4().text_lg().font_weight(gpui::FontWeight::SEMIBOLD).text_color(c(p.text)).child("Modifications locales"))
             .child(appear(
-                self.with_menu(files, cx),
+                self.with_menu(div().id("changes-files").flex_1().min_h_0().flex().flex_col().px_3().pb_3().child(files), cx),
                 "changes-in",
                 6.,
                 0.,
@@ -857,8 +922,18 @@ impl Rameau {
         let d = self.details.as_ref()?;
         let Selection::Commit(id) = self.selection else { return None };
         let (title, body) = d.message.split_once('\n').unwrap_or((&d.message, ""));
-        let files: Vec<_> =
-            d.files.iter().enumerate().map(|(i, f)| self.file_row(("file", i), f, DiffSource::Commit(id), None, cx)).collect();
+        // Virtualized: a commit can touch tens of thousands of files (imports, vendoring).
+        let files = uniform_list(
+            "details-files",
+            d.files.len(),
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                let Some(d) = &this.details else { return vec![] };
+                range
+                    .filter_map(|i| d.files.get(i).map(|f| div().w_full().h(px(LIST_ROW_H)).flex().flex_col().justify_center().child(this.file_row(("file", i), f, DiffSource::Commit(id), None, cx))))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1();
         let hash = d.id.clone();
         let chip = |text: String| {
             div().px_2().py_0p5().rounded(px(6.)).bg(c(p.hover)).text_xs().font_family(mono()).text_color(c(p.muted)).child(text)
@@ -871,14 +946,16 @@ impl Rameau {
                 .bg(c(p.panel))
                 .border_l_1()
                 .border_color(c(p.border))
-                .overflow_y_scroll()
-                .child(appear(
-            div()
-                .p_5()
                 .flex()
                 .flex_col()
-                .gap_5()
+                .child(appear(
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
                 .child(
+                    // Message, author and hash scroll on their own: a long message never hides the files.
+                    div().id("details-info").flex_none().max_h(relative(0.5)).overflow_y_scroll().p_5().pb_2().flex().flex_col().gap_5().child(
                     div()
                         .flex()
                         .flex_col()
@@ -932,14 +1009,9 @@ impl Rameau {
                             )
                         }),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(div().flex().items_center().gap_2().pb_1().child(label("FICHIERS")).child(badge(d.files.len(), false)))
-                        .children(files),
-                ),
+                )
+                .child(div().flex_none().flex().items_center().gap_2().px_5().pt_3().pb_1().child(label("FICHIERS")).child(badge(d.files.len(), false)))
+                .child(div().flex_1().min_h_0().flex().flex_col().px_3().pb_3().child(files)),
                 // Replays for each commit selected.
                 ("details-in", key(id)),
                 6.,
@@ -950,20 +1022,19 @@ impl Rameau {
 
     /// Invisible 6px grip on a panel edge: a thin accent line shows on hover and while dragging.
     /// Double-click restores the default width.
-    fn resize_handle(&self, side: Side, cx: &mut Context<Self>) -> impl IntoElement {
+    /// `x`: the panel edge, from the left of the window. Drawn over the panels as the last child of
+    /// their row, not with `deferred`: dialogs and menus, drawn after the row, must stay above it.
+    fn resize_handle(&self, side: Side, x: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal();
         let active = self.resizing == Some(side);
         let id = if side == Side::Left { "resize-left" } else { "resize-right" };
-        div().w(px(0.)).h_full().relative().child(
-            // Painted last so the panels on both sides don't cover the grip.
-            deferred(
-                div()
+        div()
                     .id(id)
                     .group(id)
                     .absolute()
                     .top_0()
                     .bottom_0()
-                    .left(px(-3.))
+                    .left(px(x - 3.))
                     .w(px(6.))
                     .cursor_col_resize()
                     .flex()
@@ -987,9 +1058,7 @@ impl Rameau {
                         if e.click_count() == 2 {
                             this.reset_width(side, cx);
                         }
-                    })),
-            ),
-        )
+                    }))
     }
 
     /// Right-click menu on a zone. Its rows set `menu_target` on right mouse down; the zone
@@ -1044,15 +1113,12 @@ impl Rameau {
                     .item(PopupMenuItem::new("Copier le hash").icon(IconName::Copy).on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))))
             }
             Some(MenuTarget::Branch(name, kind)) => {
-                // `git switch feature` on a remote-only branch creates the local tracking branch.
-                let local = match kind {
-                    RefKind::Remote => name.split_once('/').map_or(name.as_str(), |(_, b)| b),
-                    _ => name.as_str(),
-                };
+                let locals: Vec<&str> = pr.history.branches.iter().filter(|b| b.kind != RefKind::Remote).map(|b| b.name.as_str()).collect();
+                let checkout = crate::app::checkout_args(&name, kind == RefKind::Remote, &locals);
                 let is_head = kind == RefKind::Head;
                 let (n1, k1) = (name.clone(), kind);
                 let delete_label = if kind == RefKind::Remote { "Supprimer sur le serveur…" } else { "Supprimer la branche…" };
-                menu.item(git(format!("Checkout {name}"), "Checkout", args(&["switch", local])).disabled(is_head))
+                menu.item(git(format!("Checkout {name}"), "Checkout", checkout).disabled(is_head))
                     .separator()
                     .item(git(format!("Merger {name} dans {head}"), "Merge", args(&["merge", "--no-edit", &name])).disabled(is_head))
                     .item(git(format!("Rebaser {head} sur {name}"), "Rebase", args(&["rebase", "--autostash", &name])).disabled(is_head))
@@ -1126,7 +1192,7 @@ fn paint_graph(bounds: Bounds<Pixels>, row: &Row, is_merge: bool, window: &mut W
     let o = bounds.origin;
     let x = |lane: usize| o.x + px(10. + LANE_W * lane as f32 + LANE_W / 2.);
     let (top, mid, bottom) = (o.y, o.y + px(ROW_H / 2.), o.y + px(ROW_H));
-    let visible = |lane: usize| lane < MAX_GRAPH_LANES;
+    let visible = |lane: usize| lane < crate::graph::MAX_LANES;
     for s in &row.segments {
         if !visible(s.from) || !visible(s.to) {
             continue;
@@ -1182,11 +1248,12 @@ impl Render for Rameau {
                     .flex_1()
                     .min_h_0()
                     .flex()
+                    .relative()
                     .child(self.sidebar(pr, cx))
-                    .child(self.resize_handle(Side::Left, cx))
                     .child(div().id("center").flex_1().min_w_0().flex().flex_col().children(self.state_banner(pr, cx)).child(main))
-                    .when(has_right, |d| d.child(self.resize_handle(Side::Right, cx)))
                     .children(right)
+                    .child(self.resize_handle(Side::Left, self.sidebar_w(), cx))
+                    .when(has_right, |d| d.child(self.resize_handle(Side::Right, self.viewport_w - self.panel_w(), cx)))
                     .into_any_element()
             }
         };
@@ -1232,5 +1299,44 @@ impl Render for Rameau {
             ))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_unfinished_operation_gets_its_own_commands() {
+        let dir = crate::app::tests::temp("bisect");
+        let git = |a: &[&str]| crate::app::tests::git(&dir, a);
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "c1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "c2"]);
+        git(&["bisect", "start", "HEAD", "HEAD~1"]);
+        let state = git2::Repository::open(&dir).unwrap().state();
+        let op = operation(state).unwrap();
+        assert_eq!((op.title, op.cont, op.abort), ("Bisect en cours", None, &["bisect", "reset"][..]));
+        // The banner's abort command really ends it.
+        let a: Vec<&str> = op.abort.to_vec();
+        git(&a);
+        assert!(operation(git2::Repository::open(&dir).unwrap().state()).is_none());
+        assert_eq!(operation(RepositoryState::Merge).unwrap().abort, ["merge", "--abort"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn change_items_skip_empty_groups_in_order() {
+        let ch = Changes {
+            staged: vec![('M', "a".into())],
+            unstaged: (0..20_000).map(|i| ('A', format!("node_modules/{i}"))).collect(),
+            conflicted: vec![],
+        };
+        let items = Rameau::change_items(&ch);
+        assert_eq!(items.len(), 2 + 20_001);
+        assert_eq!(items[0], ChangeItem::Header(FileGroup::Unstaged, 20_000));
+        assert_eq!(items[1], ChangeItem::File(FileGroup::Unstaged, 0));
+        assert_eq!(items[20_001], ChangeItem::Header(FileGroup::Staged, 1));
+        assert_eq!(items[20_002], ChangeItem::File(FileGroup::Staged, 0));
     }
 }

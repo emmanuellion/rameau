@@ -21,8 +21,6 @@ use crate::theme::{self, alpha, c, mono, pal};
 use crate::ui::{appear, button_sm, key};
 
 const LINE_H: f32 = 22.;
-// No syntax colors over 1 MB: on such files (generated, minified) colors cost more time than they help.
-const MAX_HIGHLIGHT_BYTES: usize = 1 << 20;
 
 type Styles = Vec<(Range<usize>, HighlightStyle)>;
 
@@ -37,7 +35,7 @@ pub fn highlight(repo: &Repository, source: &DiffSource, path: &str, lines: &[Di
     }
     let theme = if theme::is_light() { HighlightTheme::default_light() } else { HighlightTheme::default_dark() };
     let side = |text: Option<String>| {
-        text.filter(|t| t.len() <= MAX_HIGHLIGHT_BYTES).map(|t| {
+        text.filter(|t| t.len() <= repo::MAX_HIGHLIGHT_BYTES).map(|t| {
             let mut h = SyntaxHighlighter::new(lang.name());
             h.update(None, &Rope::from(t.as_str()));
             let starts: Vec<usize> = std::iter::once(0).chain(t.match_indices('\n').map(|(i, _)| i + 1)).collect();
@@ -208,6 +206,7 @@ fn diff_line(d: &OpenDiff, ix: usize, cx: &mut Context<Rameau>) -> AnyElement {
         LineKind::Removed => (Some(alpha(p.red, 0.13)), "-", p.red),
         LineKind::Hunk => (Some(alpha(p.accent, 0.08)), "", p.accent),
         LineKind::Info | LineKind::NoNewline => (None, "", p.muted),
+        LineKind::Marker => (Some(alpha(p.yellow, 0.22)), "!", p.yellow),
         LineKind::Context => (None, "", p.faint),
     };
     let selected = d.selected.contains(&ix);

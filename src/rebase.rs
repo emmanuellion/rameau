@@ -85,10 +85,25 @@ pub fn todo_text(steps: &[(Action, String, Option<PathBuf>)]) -> Result<String, 
         has_previous |= *action != Action::Drop;
         out.push_str(&format!("{verb} {sha}\n"));
         if let (Action::Reword, Some(file)) = (action, message_file) {
-            out.push_str(&format!("exec git commit --amend --only --quiet -F '{}'\n", file.display()));
+            out.push_str(&format!("exec git commit --amend --only --quiet -F {}\n", sh_quote(file)));
         }
     }
     Ok(out)
+}
+
+/// A path as one shell word (git runs both commands through `sh`, Git for Windows too):
+/// in single quotes, where only `'` itself needs escaping, as `'\''`.
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// Arguments and environment of `git rebase -i` using our todo list: git calls the "sequence
+/// editor" with its own todo file, which we just overwrite with ours.
+pub fn command(base: Option<Oid>, todo_file: &Path) -> (Vec<String>, Vec<(String, String)>) {
+    let mut args = vec!["rebase".to_owned(), "-i".into(), "--autostash".into()];
+    args.push(base.map_or("--root".into(), |b| b.to_string()));
+    let env = vec![("GIT_SEQUENCE_EDITOR".to_owned(), format!("cp {}", sh_quote(todo_file)))];
+    (args, env)
 }
 
 impl RebaseEditor {
@@ -110,8 +125,8 @@ impl RebaseEditor {
                 if msg.is_empty() {
                     return Err(format!("Le message de {} est vide.", &s.id.to_string()[..7]));
                 }
-                // shortcut: message files stay in the temp dir (an `exec` may run later, after a conflict).
-                let path = dir.join(format!("rameau-reword-{}-{i}.txt", std::process::id()));
+                // shortcut: message files stay in .git (an `exec` may run later, after a conflict).
+                let path = dir.join(format!("rameau-reword-{i}.txt"));
                 std::fs::write(&path, msg).map_err(|e| e.to_string())?;
                 file = Some(path);
             }
@@ -205,6 +220,37 @@ impl Render for RebaseEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_rebase_drops_and_rewords() {
+        use crate::app::tests::{git, temp};
+        // Temp folders live under the user name on Windows (C:\Users\O'Brien\…).
+        let root = temp("rebase-e2e");
+        let dir = root.join("l'atelier");
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        let mut ids = vec![];
+        for name in ["c1", "c2", "c3"] {
+            std::fs::write(dir.join(name), name).unwrap();
+            git(&dir, &["add", name]);
+            git(&dir, &["commit", "-qm", name]);
+            ids.push(git(&dir, &["rev-parse", "HEAD"]).trim().to_owned());
+        }
+        let message = dir.join("message.txt");
+        std::fs::write(&message, "c3 reformulé").unwrap();
+        let todo = todo_text(&[(Action::Drop, ids[1].clone(), None), (Action::Reword, ids[2].clone(), Some(message))]).unwrap();
+        let todo_file = dir.join("todo.txt");
+        std::fs::write(&todo_file, todo).unwrap();
+
+        let (args, mut env) = command(Some(Oid::from_str(&ids[0]).unwrap()), &todo_file);
+        for (k, v) in [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")] {
+            env.push((k.to_owned(), v.to_owned()));
+        }
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::git::exec(&dir, &a, None, None, &env).unwrap();
+        assert_eq!(git(&dir, &["log", "--format=%s"]), "c3 reformulé\nc1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn todo_list() {

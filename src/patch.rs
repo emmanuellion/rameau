@@ -107,6 +107,27 @@ mod tests {
     }
 
     #[test]
+    fn discard_single_added_line() {
+        use crate::app::LineOp;
+        let dir = std::env::temp_dir().join(format!("rameau-patch-discard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        sh(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("f"), "a\nb\nc\n").unwrap();
+        sh(&dir, &["add", "f"]);
+        sh(&dir, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        std::fs::write(dir.join("f"), "a\nB\nc\nd\n").unwrap();
+        let repo = git2::Repository::open(&dir).unwrap();
+        // Discard only "+d": "B" must stay, as the app applies it (reverse, on the working file).
+        let (lines, _) = repo::file_diff(&repo, &DiffSource::Unstaged, "f").unwrap();
+        let d = lines.iter().position(|l| l.kind == LineKind::Added && l.text == "d").unwrap();
+        let p = build("f", &lines, |i| i == d, LineOp::Discard.reversed()).unwrap();
+        git::exec(&dir, &["apply", "--recount", "--reverse", "-"], Some(&p), None, &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("f")).unwrap(), "a\nB\nc\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn last_line_without_newline() {
         let dir = std::env::temp_dir().join(format!("rameau-patch-eof-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
