@@ -113,6 +113,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         sh(&dir, &["init", "-q"]);
+        // Git for Windows writes working files with CRLF by default: compare the content, not the line ends.
+        sh(&dir, &["config", "core.autocrlf", "false"]);
         std::fs::write(dir.join("f"), "a\nb\nc\n").unwrap();
         sh(&dir, &["add", "f"]);
         sh(&dir, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);

@@ -225,11 +225,14 @@ mod tests {
         let dir = crate::app::tests::temp("token-leak");
         let store = dir.join("store-utilisateur");
         let global = dir.join("gitconfig");
-        std::fs::write(&global, format!("[credential]\n\thelper = store --file=\"{}\"\n", store.display())).unwrap();
         let env = vec![
             ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
             ("GIT_CONFIG_GLOBAL".to_owned(), global.display().to_string()),
         ];
+        // Written by git itself: a hand-written config file would read the `\` of Windows paths
+        // (C:\Users\…) as escapes. Single quotes keep them for the shell that runs the helper.
+        let helper = format!("store --file='{}'", store.display());
+        exec(&dir, &["config", "--global", "credential.helper", &helper], None, None, &env).unwrap();
         // What a push does: ask for a credential, then report it as working.
         let cred = exec(&dir, &["credential", "fill"], Some("protocol=https\nhost=github.com\n\n"), Some("s3cret"), &env).unwrap();
         assert!(cred.contains("password=s3cret"), "the user's helper is empty: Rameau's token answers");

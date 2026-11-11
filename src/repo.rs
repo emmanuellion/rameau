@@ -617,8 +617,9 @@ mod tests {
         let (lines, selectable) = file_diff(&Repository::open(&dir).unwrap(), &DiffSource::Unstaged, "k").unwrap();
         assert!(!selectable);
         assert_eq!(lines.iter().filter(|l| l.kind == LineKind::Marker).count(), 3);
-        assert!(lines.iter().any(|l| l.kind == LineKind::Context && l.text == "M"));
-        assert!(lines.iter().any(|l| l.kind == LineKind::Context && l.text == "X"));
+        // With Git for Windows' default CRLF the lines end with \r (the view drops it when drawing).
+        let has = |t: &str| lines.iter().any(|l| l.kind == LineKind::Context && l.text.trim_end_matches('\r') == t);
+        assert!(has("M") && has("X"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
