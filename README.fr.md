@@ -99,9 +99,9 @@ Télécharge la dernière version sur la page [**Releases**](https://github.com/
 
 | Système | Fichier |
 |---|---|
-| macOS 11+ (Apple Silicon et Intel) | `rameau-…-macos-universal.dmg` |
-| Windows 10/11 (x64) | `rameau-…-windows-x86_64.zip` |
-| Linux (x64 / ARM64) | `rameau-…-linux-x86_64.AppImage`, `…-aarch64.AppImage`, ou les `.tar.gz` |
+| macOS 11+ (Apple Silicon et Intel) | [`rameau-macos-universal.dmg`](https://github.com/emmanuellion/rameau/releases/latest/download/rameau-macos-universal.dmg) |
+| Windows 10/11 (x64) | [`rameau-windows-x86_64-setup.exe`](https://github.com/emmanuellion/rameau/releases/latest/download/rameau-windows-x86_64-setup.exe) (installateur) ou [`rameau-windows-x86_64.zip`](https://github.com/emmanuellion/rameau/releases/latest/download/rameau-windows-x86_64.zip) (portable) |
+| Linux (x64 / ARM64) | [`rameau-linux-x86_64.AppImage`](https://github.com/emmanuellion/rameau/releases/latest/download/rameau-linux-x86_64.AppImage), [`rameau-linux-aarch64.AppImage`](https://github.com/emmanuellion/rameau/releases/latest/download/rameau-linux-aarch64.AppImage), ou les `.tar.gz` |
 
 <details>
 <summary><b>macOS</b> : premier lancement</summary>
@@ -117,7 +117,9 @@ xattr -dr com.apple.quarantine /Applications/Rameau.app
 <details>
 <summary><b>Windows</b> : SmartScreen</summary>
 
-Installe [Git pour Windows](https://git-scm.com/download/win), dézippe l'archive et lance `rameau.exe`.
+Installe [Git pour Windows](https://git-scm.com/download/win), puis lance `rameau-setup.exe` : il installe Rameau pour
+ton compte (sans droits administrateur), avec un raccourci dans le menu Démarrer, et se désinstalle depuis
+**Paramètres › Applications**. Version portable : dézippe le `.zip` et lance `rameau.exe`.
 Si SmartScreen affiche « Windows a protégé votre ordinateur » : **Informations complémentaires › Exécuter quand même**.
 </details>
 
@@ -125,8 +127,8 @@ Si SmartScreen affiche « Windows a protégé votre ordinateur » : **Informatio
 <summary><b>Linux</b> : AppImage</summary>
 
 ```sh
-chmod +x rameau-*-linux-x86_64.AppImage
-./rameau-*-linux-x86_64.AppImage
+chmod +x rameau-linux-x86_64.AppImage
+./rameau-linux-x86_64.AppImage
 ```
 
 Il faut un pilote Vulkan (`mesa-vulkan-drivers` sur Intel/AMD, le pilote propriétaire sur NVIDIA).
@@ -154,8 +156,8 @@ sudo apt install build-essential pkg-config cmake clang git \
 ```
 </details>
 
-Empaqueter à la main : `scripts/package-macos.sh` (`.app` + `.dmg`) et `scripts/package-linux.sh`
-(AppImage + `.tar.gz`).
+Empaqueter à la main : `scripts/package-macos.sh` (`.app` + `.dmg`), `scripts/package-linux.sh`
+(AppImage + `.tar.gz`) et `packaging/windows/rameau.iss` (installateur [Inno Setup](https://jrsoftware.org/isinfo.php)).
 
 <details>
 <summary>Publier une version</summary>
