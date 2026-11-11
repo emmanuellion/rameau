@@ -57,10 +57,7 @@ jobs:
       - name: Build Linux
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libfontconfig-dev libfreetype-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libx11-xcb-dev libxcb1-dev libvulkan1 libzstd-dev desktop-file-utils
+          scripts/linux-deps.sh
           cargo build --release --locked
           scripts/package-linux.sh target/release/rameau "$VERSION" "${{ matrix.arch }}" dist
 

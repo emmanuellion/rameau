@@ -25,5 +25,8 @@ codesign --force --deep --sign - "$app"
 stage="$(mktemp -d)"
 cp -R "$app" "$stage/"
 ln -s /Applications "$stage/Applications"
-hdiutil create -volname Rameau -srcfolder "$stage" -ov -format UDZO "$out/rameau-$version-macos-universal.dmg" >/dev/null
+# Explicit size: hdiutil's own estimate is sometimes too small on CI runners ("No space left").
+size_mb=$(( $(du -sm "$stage" | cut -f1) + 50 ))
+hdiutil create -volname Rameau -srcfolder "$stage" -fs HFS+ -size "${size_mb}m" -ov -format UDZO \
+  "$out/rameau-$version-macos-universal.dmg" >/dev/null
 echo "$out/rameau-$version-macos-universal.dmg"
