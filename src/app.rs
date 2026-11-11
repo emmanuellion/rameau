@@ -168,6 +168,8 @@ pub struct Rameau {
     load_task: Option<Task<()>>,
     login_task: Option<Task<()>>,
     status_task: Option<Task<()>>,
+    /// Bumped by each status refresh: a full load that started earlier must not overwrite its result.
+    status_gen: u64,
     diff_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -180,7 +182,7 @@ impl Rameau {
             // Pick up changes made outside the app (editor, terminal) when coming back to it.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
-                    this.reload(window, cx);
+                    this.refresh_on_focus(window, cx);
                 }
             }),
             cx.subscribe_in(&message, window, |this, _, ev: &InputEvent, window, cx| {
@@ -228,6 +230,7 @@ impl Rameau {
             load_task: None,
             login_task: None,
             status_task: None,
+            status_gen: 0,
             diff_task: None,
             _subscriptions: subscriptions,
         };
@@ -267,6 +270,7 @@ impl Rameau {
             cx.notify();
         }
         let p = path.clone();
+        let status_at_start = self.status_gen;
         let task = cx.background_executor().spawn(async move {
             let mut repo = Repository::open(&p)?;
             let history = repo::load(&mut repo)?;
@@ -279,7 +283,9 @@ impl Rameau {
                 this.loading = false;
                 this.pending = None;
                 match result {
-                    Ok((repo, history)) => {
+                    Ok((repo, mut history)) => {
+                        let stale = !switching && this.status_gen != status_at_start;
+                        keep_fresher_changes(&mut history, this.proj.as_mut(), stale);
                         // The selected commit may be gone (rebase, amend): drop the stale details.
                         if let Selection::Commit(id) = this.selection
                             && !history.commits.iter().any(|c| c.id == id)
@@ -321,6 +327,7 @@ impl Rameau {
     /// Re-reads only the changed files (cheap even with a huge history), off the UI thread.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
         let Some(git_dir) = self.proj.as_ref().map(|p| p.repo.path().to_owned()) else { return };
+        self.status_gen += 1;
         let task = cx.background_executor().spawn(async move {
             let repo = Repository::open(&git_dir)?;
             let changes = repo::changes(&repo)?;
@@ -346,6 +353,24 @@ impl Rameau {
             })
             .ok();
         }));
+    }
+
+    /// Back in the window: files may have changed (editor), the history rarely did. Reload the
+    /// history only when its refs moved (commit, fetch… in a terminal), else just the file lists.
+    fn refresh_on_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = &self.proj else { return self.reload(window, cx) };
+        if self.pending.is_some() {
+            return self.reload(window, cx);
+        }
+        let (git_dir, known) = (p.repo.path().to_owned(), p.history.fingerprint);
+        let task = cx.background_executor().spawn(async move {
+            Repository::open(&git_dir).map(|r| repo::fingerprint(&r) != known).unwrap_or(true)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let moved = task.await;
+            this.update_in(cx, |this, window, cx| if moved { this.reload(window, cx) } else { this.refresh_status(cx) }).ok();
+        })
+        .detach();
     }
 
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -894,6 +919,14 @@ impl Rameau {
     }
 }
 
+/// A full load read the file statuses before a status refresh that started after it (e.g. a
+/// file was checked right after coming back to the window): keep the refresh's newer lists.
+fn keep_fresher_changes(loaded: &mut History, current: Option<&mut Project>, stale: bool) {
+    if let (true, Some(p)) = (stale, current) {
+        loaded.changes = std::mem::take(&mut p.history.changes);
+    }
+}
+
 /// Panel widths that fit the window: when the history would get narrower than its minimum,
 /// the right panel shrinks first, then the sidebar, never below their own minimum.
 /// The widths the user chose stay saved and come back when the window grows again.
@@ -933,7 +966,27 @@ pub fn pull_args(repo: &Repository) -> Vec<&'static str> {
 /// Canonical project folder (no trailing slash, symlinks resolved) so a project is listed once.
 pub fn repo_root(r: &Repository) -> PathBuf {
     let p = r.workdir().unwrap_or(r.path());
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned())
+    canonical(p).unwrap_or_else(|| p.to_owned())
+}
+
+/// `fs::canonicalize`, minus the `\\?\` prefix it adds on Windows: git, dialogs and users
+/// expect `C:\dev\projet`, not `\\?\C:\dev\projet`.
+pub fn canonical(p: &std::path::Path) -> Option<PathBuf> {
+    let full = std::fs::canonicalize(p).ok()?;
+    if cfg!(windows) {
+        let plain = full.to_str().and_then(strip_verbatim).map(PathBuf::from);
+        return Some(plain.unwrap_or(full));
+    }
+    Some(full)
+}
+
+/// `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share` → `\\srv\share`; None when there is no prefix.
+fn strip_verbatim(s: &str) -> Option<String> {
+    let rest = s.strip_prefix(r"\\?\")?;
+    Some(match rest.strip_prefix(r"UNC\") {
+        Some(unc) => format!(r"\\{unc}"),
+        None => rest.to_owned(),
+    })
 }
 
 /// Folder name `git clone` would pick: `https://github.com/a/b.git` and `git@github.com:a/b` give `b`.
@@ -1019,6 +1072,37 @@ pub(crate) mod tests {
         assert_eq!(super::fit_widths(1320., (256., 680.)), (256., 644.));
         // Enough room: untouched.
         assert_eq!(super::fit_widths(1600., (256., 380.)), (256., 380.));
+    }
+
+    #[test]
+    fn late_full_load_keeps_newer_file_status() {
+        let dir = temp("race");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("f"), "1\n").unwrap();
+        let open = || git2::Repository::open(&dir).unwrap();
+        // The full load reads the status first: f is not staged yet...
+        let mut loaded = crate::repo::load(&mut open()).unwrap();
+        assert_eq!(loaded.changes.staged.len(), 0);
+        // ...then f gets checked and the status refresh lands before the load.
+        git(&dir, &["add", "f"]);
+        let mut current = super::Project { path: dir.clone(), repo: open(), history: crate::repo::load(&mut open()).unwrap() };
+        assert_eq!(current.history.changes.staged.len(), 1);
+        super::keep_fresher_changes(&mut loaded, Some(&mut current), true);
+        assert_eq!(loaded.changes.staged.len(), 1, "the late load must not uncheck f");
+        // Not stale: the load's own result is used.
+        let mut fresh = crate::repo::load(&mut open()).unwrap();
+        fresh.changes.staged.clear();
+        super::keep_fresher_changes(&mut fresh, Some(&mut current), false);
+        assert!(fresh.changes.staged.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_paths_lose_their_verbatim_prefix() {
+        assert_eq!(super::strip_verbatim(r"\\?\C:\dev\projet").as_deref(), Some(r"C:\dev\projet"));
+        assert_eq!(super::strip_verbatim(r"\\?\UNC\nas\code\p").as_deref(), Some(r"\\nas\code\p"));
+        assert_eq!(super::strip_verbatim(r"C:\dev"), None);
+        assert_eq!(super::strip_verbatim("/Users/x"), None);
     }
 
     #[test]

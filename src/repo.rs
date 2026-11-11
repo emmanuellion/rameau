@@ -48,6 +48,8 @@ pub struct History {
     pub head: String,
     /// Local branch HEAD points to (None when detached).
     pub head_branch: Option<String>,
+    /// HEAD points to a commit (false in a repository without commits: nothing to push).
+    pub has_commits: bool,
     /// (ahead, behind) of the HEAD branch vs its upstream; None when it has no upstream.
     pub ahead_behind: Option<(usize, usize)>,
     pub state: RepositoryState,
@@ -56,6 +58,8 @@ pub struct History {
     pub rows: Vec<Row>,
     pub branches: Vec<Branch>,
     pub max_lanes: usize,
+    /// `fingerprint` at load time: when it hasn't moved, the history is still up to date.
+    pub fingerprint: u64,
 }
 
 pub struct Details {
@@ -78,9 +82,15 @@ pub fn load(repo: &mut Repository) -> Result<History, git2::Error> {
     let mut labels: HashMap<Oid, Vec<RefLabel>> = HashMap::new();
     let mut branches = Vec::new();
     let head = repo.head().ok();
+    // A repository without commits has no HEAD commit, but HEAD still names its branch.
+    let unborn = || {
+        let r = repo.find_reference("HEAD").ok()?;
+        r.symbolic_target().map(|t| t.trim_start_matches("refs/heads/").to_owned())
+    };
     let head_name = head
         .as_ref()
         .and_then(|h| h.shorthand().map(str::to_owned))
+        .or_else(unborn)
         .unwrap_or_else(|| "HEAD".into());
     let detached = repo.head_detached().unwrap_or(false);
     let head_branch = (!detached).then(|| head_name.clone());
@@ -172,6 +182,7 @@ pub fn load(repo: &mut Repository) -> Result<History, git2::Error> {
         stashes,
         head: head_name,
         head_branch,
+        has_commits: head.as_ref().is_some_and(|h| h.target().is_some()),
         ahead_behind,
         state: repo.state(),
         changes: changes(repo)?,
@@ -179,6 +190,7 @@ pub fn load(repo: &mut Repository) -> Result<History, git2::Error> {
         rows,
         branches,
         max_lanes,
+        fingerprint: fingerprint(repo),
     })
 }
 
@@ -360,6 +372,24 @@ fn commit_diff<'r>(repo: &'r Repository, id: Oid, opts: &mut DiffOptions) -> Res
     repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&c.tree()?), Some(opts))
 }
 
+/// Cheap summary of everything the history view shows: each ref and where it points (branches,
+/// tags, remotes, stash), where HEAD points and the ongoing operation. Reading it takes a few ms,
+/// against a full history load for large repositories.
+pub fn fingerprint(repo: &Repository) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Ok(refs) = repo.references() {
+        for r in refs.flatten() {
+            (r.name_bytes(), r.target(), r.symbolic_target_bytes()).hash(&mut h);
+        }
+    }
+    if let Ok(head) = repo.find_reference("HEAD") {
+        (head.target(), head.symbolic_target_bytes()).hash(&mut h);
+    }
+    (repo.state() as u32).hash(&mut h);
+    h.finish()
+}
+
 pub fn details(repo: &Repository, id: Oid) -> Result<Details, git2::Error> {
     let c = repo.find_commit(id)?;
     let diff = commit_diff(repo, id, &mut DiffOptions::new())?;
@@ -442,6 +472,57 @@ mod tests {
         assert_eq!(staged, [('A', "s".to_owned()), ('M', "b".to_owned())]);
         assert_eq!(unstaged, [('A', "n".to_owned()), ('D', "c".to_owned()), ('M', "a".to_owned())]);
         assert_eq!(ch.conflicted, ["k"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fingerprint_moves_with_history_only() {
+        let dir = temp("fingerprint");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("f"), "1").unwrap();
+        git(&dir, &["add", "f"]);
+        git(&dir, &["commit", "-qm", "c1"]);
+        let fp = || fingerprint(&Repository::open(&dir).unwrap());
+        let start = fp();
+        // Editing or staging a file: same history.
+        std::fs::write(dir.join("f"), "2").unwrap();
+        git(&dir, &["add", "f"]);
+        assert_eq!(fp(), start);
+        // Everything that changes what the history shows moves it.
+        let mut seen = vec![start];
+        let mut moved = |label: &str| {
+            let now = fp();
+            assert!(!seen.contains(&now), "{label} did not change the fingerprint");
+            seen.push(now);
+        };
+        git(&dir, &["commit", "-qm", "c2"]);
+        moved("commit");
+        git(&dir, &["branch", "side"]);
+        moved("new branch");
+        git(&dir, &["tag", "v1"]);
+        moved("tag");
+        git(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD~1"]);
+        moved("fetch");
+        std::fs::write(dir.join("f"), "3").unwrap();
+        git(&dir, &["stash", "-q"]);
+        moved("stash");
+        git(&dir, &["switch", "-q", "--detach", "HEAD~1"]);
+        moved("checkout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_repository_shows_its_branch() {
+        let dir = temp("unborn");
+        git(&dir, &["init", "-q", "-b", "trunk"]);
+        let h = load(&mut Repository::open(&dir).unwrap()).unwrap();
+        assert_eq!(h.head, "trunk");
+        assert_eq!(h.head_branch.as_deref(), Some("trunk"));
+        assert!(!h.has_commits && h.commits.is_empty());
+        std::fs::write(dir.join("f"), "1").unwrap();
+        git(&dir, &["add", "f"]);
+        git(&dir, &["commit", "-qm", "first"]);
+        assert!(load(&mut Repository::open(&dir).unwrap()).unwrap().has_commits);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

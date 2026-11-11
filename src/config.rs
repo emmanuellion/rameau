@@ -60,6 +60,14 @@ impl Config {
         std::fs::rename(&tmp, path)
     }
 
+    /// Forgets projects deleted from disk since last time and lists each folder once,
+    /// whatever way its path was written (trailing slash, symlink…).
+    pub fn tidy(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.projects = self.projects.iter().filter_map(|p| crate::app::canonical(p)).filter(|p| seen.insert(p.clone())).collect();
+        self.last = self.last.as_ref().and_then(|p| crate::app::canonical(p)).or_else(|| self.projects.first().cloned());
+    }
+
     pub fn add(&mut self, path: &Path) {
         if !self.projects.iter().any(|p| p == path) {
             self.projects.push(path.to_owned());
@@ -78,6 +86,25 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tidy_lists_each_project_once() {
+        let dir = crate::app::tests::temp("tidy");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let mut config = Config {
+            // Same folder twice, not side by side, plus a deleted one.
+            projects: vec![a.join("."), b.clone(), PathBuf::from(format!("{}/", a.display())), dir.join("gone")],
+            last: Some(dir.join("gone")),
+            ..Config::default()
+        };
+        config.tidy();
+        let canon = |p: &Path| crate::app::canonical(p).unwrap();
+        assert_eq!(config.projects, [canon(&a), canon(&b)]);
+        assert_eq!(config.last, Some(canon(&a)), "a deleted last project falls back to the first one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn save_replaces_the_file_whole() {

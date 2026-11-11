@@ -11,7 +11,7 @@ use gpui_component::{
     Disableable, Icon, IconName, Root, Sizable, TitleBar,
     button::ButtonVariants,
     input::Input,
-    menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
+    menu::{ContextMenu, ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
 };
 
 use crate::app::{CloseDiff, GitJob, Login, MenuTarget, Page, Project, Rameau, SelectNext, SelectPrev, Selection, Side};
@@ -121,7 +121,7 @@ impl Rameau {
         let h = &pr.history;
         let busy = self.busy.is_some();
         let (ahead, behind) = h.ahead_behind.unwrap_or((0, 0));
-        let push_primary = ahead > 0 || h.ahead_behind.is_none();
+        let push_primary = h.has_commits && (ahead > 0 || h.ahead_behind.is_none());
         TitleBar::new().h(px(TITLE_BAR_H)).child(
             bar.child(
                 div()
@@ -136,7 +136,7 @@ impl Rameau {
                     .child(icon("git-branch").xsmall().text_color(c(p.accent)))
                     .child(h.head.clone()),
             )
-            .when(h.head_branch.is_some() && h.ahead_behind.is_none(), |d| {
+            .when(h.has_commits && h.head_branch.is_some() && h.ahead_behind.is_none(), |d| {
                 d.child(div().pl_1().text_xs().text_color(c(p.faint)).child("pas encore publiée"))
             })
             .child(div().flex_1())
@@ -196,7 +196,7 @@ impl Rameau {
                     .when(ahead > 0, |b| b.child(badge(ahead, true)))
                     .when(push_primary, |b| b.primary())
                     .when(!push_primary, |b| b.ghost())
-                    .disabled(busy || h.head_branch.is_none())
+                    .disabled(busy || h.head_branch.is_none() || !h.has_commits)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.push(window, cx))),
             ),
         )
@@ -370,7 +370,6 @@ impl Rameau {
 
     fn sidebar(&self, pr: &Project, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal();
-        let weak = cx.weak_entity();
         // Virtualized like the history: repositories with thousands of remote branches stay
         // smooth, even while the busy spinner redraws the window every frame.
         let list = uniform_list(
@@ -393,23 +392,19 @@ impl Rameau {
             .bg(c(p.panel))
             .border_r_1()
             .border_color(c(p.border))
-            .child(
+            .child(self.with_menu(
                 div()
                     .id("branches")
                     .flex_1()
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .child(list)
-                    .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, _| {
-                        if e.button == MouseButton::Right {
-                            this.menu_target = None;
-                        }
-                    }))
-                    .context_menu(move |menu, _, cx| Self::build_menu(&weak, menu, cx)),
-            )
+                    .child(list),
+                cx,
+            ))
             .child(self.account(cx))
     }
+
 
     fn account(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal();
@@ -643,12 +638,12 @@ impl Rameau {
             })
     }
 
-    fn commit_list(&self, pr: &Project, cx: &mut Context<Self>) -> impl IntoElement {
+    fn commit_list(&self, pr: &Project, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let p = pal();
         let cols = Columns::for_width(self.center_w);
-        let weak = cx.weak_entity();
         let col = |text: &'static str| div().text_xs().font_weight(gpui::FontWeight::MEDIUM).text_color(c(p.faint)).child(text);
-        div()
+        self.with_menu(
+            div()
             .flex_1()
             .min_h_0()
             .flex()
@@ -680,13 +675,9 @@ impl Rameau {
                 )
                 .track_scroll(self.scroll.clone())
                 .flex_1(),
-            )
-            .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, _| {
-                if e.button == MouseButton::Right {
-                    this.menu_target = None;
-                }
-            }))
-            .context_menu(move |menu, _, cx| Self::build_menu(&weak, menu, cx))
+            ),
+            cx,
+        )
     }
 
     fn file_row(
@@ -817,7 +808,6 @@ impl Rameau {
             }
         }
         let n = ch.staged.len();
-        let weak = cx.weak_entity();
         let key = if cfg!(target_os = "macos") { "⌘↩" } else { "Ctrl+↩" };
         div()
             .id("changes-panel")
@@ -829,13 +819,7 @@ impl Rameau {
             .border_l_1()
             .border_color(c(p.border))
             .child(appear(
-                files
-                    .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, _| {
-                        if e.button == MouseButton::Right {
-                            this.menu_target = None;
-                        }
-                    }))
-                    .context_menu(move |menu, _, cx| Self::build_menu(&weak, menu, cx)),
+                self.with_menu(files, cx),
                 "changes-in",
                 6.,
                 0.,
@@ -1006,6 +990,21 @@ impl Rameau {
                     })),
             ),
         )
+    }
+
+    /// Right-click menu on a zone. Its rows set `menu_target` on right mouse down; the zone
+    /// clears it first, so a right click on empty space never shows the previous row's actions.
+    fn with_menu<E>(&self, el: E, cx: &mut Context<Self>) -> ContextMenu<E>
+    where
+        E: ParentElement + Styled + InteractiveElement + IntoElement + 'static,
+    {
+        let weak = cx.weak_entity();
+        el.capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, _| {
+            if e.button == MouseButton::Right {
+                this.menu_target = None;
+            }
+        }))
+        .context_menu(move |menu, _, cx| Self::build_menu(&weak, menu, cx))
     }
 
     fn build_menu(weak: &WeakEntity<Self>, menu: PopupMenu, cx: &mut App) -> PopupMenu {

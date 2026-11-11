@@ -32,11 +32,7 @@ fn main() {
             std::process::exit(1);
         }
     });
-    // Forget projects deleted from disk since last time, list each folder once.
-    let mut projects: Vec<_> = config.projects.iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect();
-    projects.dedup();
-    config.projects = projects;
-    config.last = config.last.as_ref().and_then(|p| std::fs::canonicalize(p).ok()).or_else(|| config.projects.first().cloned());
+    config.tidy();
 
     Application::new().with_assets(ui::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx);

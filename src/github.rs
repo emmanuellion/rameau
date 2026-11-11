@@ -70,24 +70,45 @@ pub fn wait_for_token(client_id: &str, code: &DeviceCode) -> Result<Account, Str
     let mut interval = code.interval;
     while Instant::now() < deadline {
         sleep(Duration::from_secs(interval));
-        let v = post(
+        let response = post(
             "https://github.com/login/oauth/access_token",
             &[
                 ("client_id", client_id),
                 ("device_code", &code.device_code),
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ],
-        )?;
-        match v["error"].as_str() {
-            None => return account(str_field(&v, "access_token")?),
-            Some("authorization_pending") => {}
-            Some("slow_down") => interval = v["interval"].as_u64().unwrap_or(interval + 5),
-            Some("access_denied") => return Err("Connexion refusée sur GitHub.".into()),
-            Some("expired_token") => break,
-            Some(_) => return Err(str_field(&v, "error_description").unwrap_or_else(|e| e)),
+        );
+        match poll_step(response, interval) {
+            Poll::Wait(next) => interval = next,
+            Poll::Token(token) => return account(token),
+            Poll::Fail(e) => return Err(e),
+            Poll::Expired => break,
         }
     }
     Err("Le code a expiré, recommence la connexion.".into())
+}
+
+#[derive(Debug, PartialEq)]
+enum Poll {
+    /// Not approved yet: ask again after this many seconds.
+    Wait(u64),
+    Token(String),
+    Fail(String),
+    Expired,
+}
+
+/// What to do with one answer of GitHub's token endpoint. A network error is not fatal:
+/// the user may still be approving in the browser, so keep polling until the code expires.
+fn poll_step(response: Result<Value, String>, interval: u64) -> Poll {
+    let Ok(v) = response else { return Poll::Wait(interval) };
+    match v["error"].as_str() {
+        None => str_field(&v, "access_token").map_or_else(Poll::Fail, Poll::Token),
+        Some("authorization_pending") => Poll::Wait(interval),
+        Some("slow_down") => Poll::Wait(v["interval"].as_u64().unwrap_or(interval + 5)),
+        Some("access_denied") => Poll::Fail("Connexion refusée sur GitHub.".into()),
+        Some("expired_token") => Poll::Expired,
+        Some(_) => Poll::Fail(str_field(&v, "error_description").unwrap_or_else(|e| e)),
+    }
 }
 
 fn account(token: String) -> Result<Account, String> {
@@ -139,6 +160,17 @@ pub fn forget() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polling_survives_network_errors() {
+        let json = |s: &str| Ok(serde_json::from_str::<Value>(s).unwrap());
+        assert_eq!(poll_step(Err("GitHub injoignable".into()), 5), Poll::Wait(5));
+        assert_eq!(poll_step(json(r#"{"error":"authorization_pending"}"#), 5), Poll::Wait(5));
+        assert_eq!(poll_step(json(r#"{"error":"slow_down","interval":10}"#), 5), Poll::Wait(10));
+        assert_eq!(poll_step(json(r#"{"access_token":"t"}"#), 5), Poll::Token("t".into()));
+        assert_eq!(poll_step(json(r#"{"error":"expired_token"}"#), 5), Poll::Expired);
+        assert!(matches!(poll_step(json(r#"{"error":"access_denied"}"#), 5), Poll::Fail(_)));
+    }
 
     /// With two github.com entries stored (the user's own token and Rameau's), Rameau must
     /// read and delete only its own. Checked with git's `store` helper on a temp file.
