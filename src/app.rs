@@ -79,6 +79,8 @@ pub enum Side {
 
 const SIDEBAR_W: f32 = 256.;
 const PANEL_W: f32 = 380.;
+const SIDEBAR_RANGE: (f32, f32) = (200., 440.);
+const PANEL_RANGE: (f32, f32) = (300., 680.);
 /// The history keeps at least this much room when panels grow.
 const CENTER_MIN_W: f32 = 420.;
 
@@ -100,6 +102,8 @@ pub struct GitJob {
     env: Vec<(String, String)>,
     done: Option<&'static str>,
     after: Option<After>,
+    /// Only the working copy changes (staging, discarding): refresh the file lists, not the history.
+    status_only: bool,
 }
 
 impl GitJob {
@@ -108,7 +112,7 @@ impl GitJob {
     }
 
     pub fn owned(what: &'static str, args: Vec<String>) -> Self {
-        Self { what, args, dir: None, input: None, env: vec![], done: None, after: None }
+        Self { what, args, dir: None, input: None, env: vec![], done: None, after: None, status_only: false }
     }
 
     pub fn done(mut self, msg: &'static str) -> Self {
@@ -118,6 +122,11 @@ impl GitJob {
 
     pub fn after(mut self, f: impl FnOnce(&mut Rameau, &mut Window, &mut Context<Rameau>) + 'static) -> Self {
         self.after = Some(Box::new(f));
+        self
+    }
+
+    pub fn status_only(mut self) -> Self {
+        self.status_only = true;
         self
     }
 
@@ -154,8 +163,12 @@ pub struct Rameau {
     pub resizing: Option<Side>,
     /// Width left for the history, refreshed each frame (decides which columns fit).
     pub center_w: f32,
+    /// Window width at the last frame: panel widths are fitted into it.
+    pub viewport_w: f32,
     load_task: Option<Task<()>>,
     login_task: Option<Task<()>>,
+    status_task: Option<Task<()>>,
+    diff_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -211,8 +224,11 @@ impl Rameau {
             focus,
             resizing: None,
             center_w: 1000.,
+            viewport_w: 1320.,
             load_task: None,
             login_task: None,
+            status_task: None,
+            diff_task: None,
             _subscriptions: subscriptions,
         };
         if let Some(path) = open.or_else(|| this.config.last.clone()) {
@@ -275,7 +291,7 @@ impl Rameau {
                         if switching {
                             this.selection = Selection::None;
                             this.details = None;
-                            this.diff = None;
+                            this.close_diff();
                             this.scroll = UniformListScrollHandle::new();
                             window.set_window_title(&format!("{} — Rameau", history.name));
                             this.config.add(&path);
@@ -286,7 +302,7 @@ impl Rameau {
                         if this.selection == Selection::Changes && this.history().is_some_and(|h| h.changes.is_empty()) {
                             this.selection = Selection::None;
                         }
-                        this.refresh_diff();
+                        this.refresh_diff(cx);
                     }
                     Err(e) => {
                         let msg = format!("{} : {}", path.display(), e.message());
@@ -296,6 +312,36 @@ impl Rameau {
                         }
                     }
                 }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Re-reads only the changed files (cheap even with a huge history), off the UI thread.
+    fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        let Some(git_dir) = self.proj.as_ref().map(|p| p.repo.path().to_owned()) else { return };
+        let task = cx.background_executor().spawn(async move {
+            let repo = Repository::open(&git_dir)?;
+            let changes = repo::changes(&repo)?;
+            Ok::<_, git2::Error>((repo, changes))
+        });
+        self.status_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match (result, this.proj.as_mut()) {
+                    // The fresh repository also sees the new index for the diffs.
+                    (Ok((repo, changes)), Some(p)) if p.repo.path() == repo.path() => {
+                        p.repo = repo;
+                        p.history.changes = changes;
+                    }
+                    (Err(e), _) => eprintln!("rameau: {}", e.message()),
+                    _ => {}
+                }
+                if this.selection == Selection::Changes && this.history().is_some_and(|h| h.changes.is_empty()) {
+                    this.selection = Selection::None;
+                }
+                this.refresh_diff(cx);
                 cx.notify();
             })
             .ok();
@@ -312,7 +358,7 @@ impl Rameau {
         let Some(p) = self.proj.take() else { return };
         self.config.remove(&p.path);
         self.config.save();
-        self.diff = None;
+        self.close_diff();
         self.selection = Selection::None;
         match self.config.last.clone() {
             Some(next) => self.load_project(next, window, cx),
@@ -322,16 +368,19 @@ impl Rameau {
     }
 
     pub fn select_commit(&mut self, id: Oid, cx: &mut Context<Self>) {
-        let Some(p) = &self.proj else { return };
+        if self.proj.is_none() {
+            return;
+        }
         self.selection = Selection::Commit(id);
-        self.diff = None;
+        self.close_diff();
+        let Some(p) = &self.proj else { return };
         self.details = repo::details(&p.repo, id).inspect_err(|e| eprintln!("rameau: {e}")).ok();
         cx.notify();
     }
 
     pub fn select_changes(&mut self, cx: &mut Context<Self>) {
         self.selection = Selection::Changes;
-        self.diff = None;
+        self.close_diff();
         cx.notify();
     }
 
@@ -354,33 +403,56 @@ impl Rameau {
         }
     }
 
-    pub fn open_diff(&mut self, source: DiffSource, path: String) {
-        let Some(p) = &self.proj else { return };
-        match repo::file_diff(&p.repo, &source, &path) {
-            Ok((lines, partial)) => {
-                let highlights = diff_view::highlight(&p.repo, &source, &path, &lines);
-                let longest = lines.iter().enumerate().max_by_key(|(_, l)| l.text.len()).map_or(0, |(i, _)| i);
-                let selectable = partial && !matches!(source, DiffSource::Commit(_));
-                self.diff = Some(OpenDiff {
-                    source,
-                    path,
-                    lines,
-                    selectable,
-                    highlights,
-                    selected: BTreeSet::new(),
-                    anchor: None,
-                    longest,
-                });
-                self.diff_scroll = UniformListScrollHandle::new();
-            }
-            Err(e) => eprintln!("rameau: {}", e.message()),
-        }
+    /// Computes and highlights a file diff off the UI thread (a huge generated file would
+    /// freeze the window otherwise). `keep_scroll` keeps the position when refreshing.
+    pub fn open_diff(&mut self, source: DiffSource, path: String, keep_scroll: bool, cx: &mut Context<Self>) {
+        let Some(git_dir) = self.proj.as_ref().map(|p| p.repo.path().to_owned()) else { return };
+        let task = cx.background_executor().spawn(async move {
+            let repo = Repository::open(&git_dir)?;
+            let (lines, partial) = repo::file_diff(&repo, &source, &path)?;
+            let highlights = diff_view::highlight(&repo, &source, &path, &lines);
+            let longest = lines.iter().enumerate().max_by_key(|(_, l)| l.text.len()).map_or(0, |(i, _)| i);
+            let selectable = partial && !matches!(source, DiffSource::Commit(_));
+            Ok::<_, git2::Error>(OpenDiff {
+                source,
+                path,
+                lines,
+                selectable,
+                highlights,
+                selected: BTreeSet::new(),
+                anchor: None,
+                longest,
+            })
+        });
+        // Replacing the task drops a diff still loading (another file was clicked meanwhile).
+        self.diff_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(diff) => {
+                        if !keep_scroll {
+                            this.diff_scroll = UniformListScrollHandle::new();
+                        }
+                        this.diff = Some(diff);
+                    }
+                    Err(e) => eprintln!("rameau: {}", e.message()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    pub fn close_diff(&mut self) {
+        self.diff = None;
+        // A diff still loading must not reopen once closed.
+        self.diff_task = None;
     }
 
     /// After a reload, keep the open working-copy diff in sync: it follows the file
     /// from "unstaged" to "staged" (and back), and closes when the file is clean.
-    pub fn refresh_diff(&mut self) {
-        let Some(d) = self.diff.take() else { return };
+    pub fn refresh_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = &self.diff else { return };
         let Some(ch) = self.history().map(|h| &h.changes) else { return };
         let listed = |l: &[(char, String)]| l.iter().any(|(_, p)| *p == d.path);
         let has = |s: &DiffSource| match s {
@@ -393,10 +465,13 @@ impl Rameau {
             DiffSource::Unstaged => DiffSource::Staged,
             commit => commit.clone(),
         };
-        if let Some(source) = [d.source.clone(), other].into_iter().find(has) {
-            let scroll = self.diff_scroll.clone();
-            self.open_diff(source, d.path);
-            self.diff_scroll = scroll;
+        // The current diff stays on screen until the new one is ready: no flicker.
+        match [d.source.clone(), other].into_iter().find(has) {
+            Some(source) => {
+                let path = d.path.clone();
+                self.open_diff(source, path, true, cx);
+            }
+            None => self.close_diff(),
         }
     }
 
@@ -410,7 +485,7 @@ impl Rameau {
         self.busy = Some(format!("{}…", job.what).into());
         cx.notify();
         let token = self.token();
-        let GitJob { what, args, input, env, done, after, .. } = job;
+        let GitJob { what, args, input, env, done, after, status_only, .. } = job;
         let task = cx.background_executor().spawn(async move {
             let a: Vec<&str> = args.iter().map(String::as_str).collect();
             git::exec(&dir, &a, input.as_deref(), token.as_deref(), &env)
@@ -435,7 +510,11 @@ impl Rameau {
                     ),
                     Err(e) => this.notify_error(&format!("{what} : échec"), e, window, cx),
                 }
-                this.reload(window, cx);
+                if status_only {
+                    this.refresh_status(cx);
+                } else {
+                    this.reload(window, cx);
+                }
             })
             .ok();
         })
@@ -475,14 +554,18 @@ impl Rameau {
         self.run(job, window, cx);
     }
 
+    pub fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = &self.proj else { return };
+        self.run(GitJob::new("Pull", &pull_args(&p.repo)).done("Pull terminé"), window, cx);
+    }
+
     pub fn push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = &self.proj else { return };
         let job = if p.history.ahead_behind.is_some() {
             GitJob::new("Push", &["push"])
         } else {
             // First push of this branch: publish it and set its upstream.
-            let remote = p.repo.remotes().ok().and_then(|r| r.get(0).map(str::to_owned)).unwrap_or_else(|| "origin".into());
-            GitJob::new("Push", &["push", "-u", &remote, "HEAD"])
+            GitJob::new("Push", &["push", "-u", &push_remote(&p.repo), "HEAD"])
         };
         self.run(job.done("Push terminé"), window, cx);
     }
@@ -501,7 +584,7 @@ impl Rameau {
             LineOp::Unstage => ("Retrait des lignes", &["apply", "--cached", "--recount", "--reverse", "-"]),
             LineOp::Discard => ("Abandon des lignes", &["apply", "--recount", "--reverse", "-"]),
         };
-        let job = GitJob::new(what, args).input(patch);
+        let job = GitJob::new(what, args).input(patch).status_only();
         if op == LineOp::Discard {
             let n = match hunk {
                 Some(_) => "ce bloc".to_owned(),
@@ -516,10 +599,10 @@ impl Rameau {
 
     pub fn discard_file(&mut self, path: String, untracked: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (job, msg) = if untracked {
-            (GitJob::owned("Suppression", vec!["clean".into(), "-f".into(), "--".into(), path.clone()]), format!("Le nouveau fichier {path} sera supprimé."))
+            (GitJob::owned("Suppression", vec!["clean".into(), "-f".into(), "--".into(), path.clone()]).status_only(), format!("Le nouveau fichier {path} sera supprimé."))
         } else {
             (
-                GitJob::owned("Annulation", vec!["restore".into(), "--".into(), path.clone()]),
+                GitJob::owned("Annulation", vec!["restore".into(), "--".into(), path.clone()]).status_only(),
                 format!("Les modifications non indexées de {path} seront perdues définitivement."),
             )
         };
@@ -661,27 +744,32 @@ impl Rameau {
     }
 
     pub fn logout(&mut self, cx: &mut Context<Self>) {
-        if let Login::In(a) = &self.login {
-            github::forget(a);
+        if let Login::In(_) = &self.login {
+            github::forget();
         }
         self.login = Login::Out;
         self.login_task = None;
         cx.notify();
     }
 
+    fn widths(&self) -> (f32, f32) {
+        let chosen = (self.config.sidebar_width.unwrap_or(SIDEBAR_W), self.config.panel_width.unwrap_or(PANEL_W));
+        fit_widths(self.viewport_w, chosen)
+    }
+
     pub fn sidebar_w(&self) -> f32 {
-        self.config.sidebar_width.unwrap_or(SIDEBAR_W)
+        self.widths().0
     }
 
     pub fn panel_w(&self) -> f32 {
-        self.config.panel_width.unwrap_or(PANEL_W)
+        self.widths().1
     }
 
     /// Follows the mouse while a panel edge is dragged (`x` from the window's left edge).
     pub fn resize(&mut self, side: Side, x: f32, window_w: f32, cx: &mut Context<Self>) {
         let (w, min, max) = match side {
-            Side::Left => (x, 200., 440_f32.min(window_w - self.panel_w() - CENTER_MIN_W)),
-            Side::Right => (window_w - x, 300., 680_f32.min(window_w - self.sidebar_w() - CENTER_MIN_W)),
+            Side::Left => (x, SIDEBAR_RANGE.0, SIDEBAR_RANGE.1.min(window_w - self.panel_w() - CENTER_MIN_W)),
+            Side::Right => (window_w - x, PANEL_RANGE.0, PANEL_RANGE.1.min(window_w - self.sidebar_w() - CENTER_MIN_W)),
         };
         let w = w.clamp(min, max.max(min)).round();
         match side {
@@ -726,7 +814,7 @@ impl Rameau {
         self.config.save();
         theme::apply(self.config.light, Some(window), cx);
         // Syntax colors depend on the theme.
-        self.refresh_diff();
+        self.refresh_diff(cx);
         cx.notify();
     }
 
@@ -806,6 +894,42 @@ impl Rameau {
     }
 }
 
+/// Panel widths that fit the window: when the history would get narrower than its minimum,
+/// the right panel shrinks first, then the sidebar, never below their own minimum.
+/// The widths the user chose stay saved and come back when the window grows again.
+pub fn fit_widths(viewport: f32, (mut sidebar, mut panel): (f32, f32)) -> (f32, f32) {
+    let over = sidebar + panel + CENTER_MIN_W - viewport;
+    if over > 0. {
+        let from_panel = over.min(panel - PANEL_RANGE.0).max(0.);
+        panel -= from_panel;
+        sidebar -= (over - from_panel).min(sidebar - SIDEBAR_RANGE.0).max(0.);
+    }
+    (sidebar, panel)
+}
+
+/// Where a new branch gets published, like git decides: `remote.pushDefault`, else `origin`,
+/// else the only (or first) remote.
+pub fn push_remote(repo: &Repository) -> String {
+    let names: Vec<String> = repo.remotes().map(|r| r.iter().flatten().map(str::to_owned).collect()).unwrap_or_default();
+    repo.config()
+        .and_then(|c| c.get_string("remote.pushDefault"))
+        .ok()
+        .or_else(|| names.iter().find(|n| *n == "origin").cloned())
+        .or_else(|| names.first().cloned())
+        .unwrap_or_else(|| "origin".into())
+}
+
+/// `git pull` arguments. Since git 2.33, pulling diverged branches fails until the user says
+/// how to reconcile them: merge, unless they chose otherwise with `pull.rebase`.
+pub fn pull_args(repo: &Repository) -> Vec<&'static str> {
+    let chosen = repo.config().and_then(|c| c.get_string("pull.rebase")).is_ok();
+    let mut args = vec!["pull", "--no-edit"];
+    if !chosen {
+        args.push("--no-rebase");
+    }
+    args
+}
+
 /// Canonical project folder (no trailing slash, symlinks resolved) so a project is listed once.
 pub fn repo_root(r: &Repository) -> PathBuf {
     let p = r.workdir().unwrap_or(r.path());
@@ -820,7 +944,83 @@ pub fn repo_name(url: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::path::Path;
+
+    /// Temp folder unique to this test run.
+    pub fn temp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rameau-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// git with a throwaway identity, panicking with git's message on failure.
+    pub fn git(dir: &Path, args: &[&str]) -> String {
+        let mut a = vec!["-c", "user.name=t", "-c", "user.email=t@t"];
+        a.extend(args);
+        crate::git::run(dir, &a).unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+    }
+
+    #[test]
+    fn pull_merges_diverged_branches() {
+        let root = temp("pull");
+        git(&root, &["init", "-q", "--bare", "remote.git"]);
+        git(&root, &["clone", "-q", "remote.git", "a"]);
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::write(a.join("f"), "1\n").unwrap();
+        git(&a, &["add", "f"]);
+        git(&a, &["commit", "-qm", "base"]);
+        git(&a, &["push", "-q", "origin", "HEAD"]);
+        git(&root, &["clone", "-q", "remote.git", "b"]);
+        // Diverge: one commit pushed from b, another local to a.
+        std::fs::write(b.join("g"), "b\n").unwrap();
+        git(&b, &["add", "g"]);
+        git(&b, &["commit", "-qm", "from b"]);
+        git(&b, &["push", "-q"]);
+        std::fs::write(a.join("h"), "a\n").unwrap();
+        git(&a, &["add", "h"]);
+        git(&a, &["commit", "-qm", "from a"]);
+
+        let repo = git2::Repository::open(&a).unwrap();
+        let args = super::pull_args(&repo);
+        assert!(args.contains(&"--no-rebase"));
+        git(&a, &args);
+        assert!(a.join("g").exists() && a.join("h").exists());
+
+        // An explicit choice is left to git.
+        git(&a, &["config", "pull.rebase", "true"]);
+        let repo = git2::Repository::open(&a).unwrap();
+        assert!(!super::pull_args(&repo).contains(&"--no-rebase"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_branch_goes_to_the_right_remote() {
+        let dir = temp("push");
+        git(&dir, &["init", "-q"]);
+        let open = || git2::Repository::open(&dir).unwrap();
+        git(&dir, &["remote", "add", "upstream", "https://example.com/u.git"]);
+        assert_eq!(super::push_remote(&open()), "upstream", "single remote");
+        // "fork" sorts before "origin": origin must still win.
+        git(&dir, &["remote", "add", "fork", "https://example.com/f.git"]);
+        git(&dir, &["remote", "add", "origin", "https://example.com/o.git"]);
+        assert_eq!(super::push_remote(&open()), "origin");
+        git(&dir, &["config", "remote.pushDefault", "fork"]);
+        assert_eq!(super::push_remote(&open()), "fork");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panels_fit_a_shrinking_window() {
+        // Wide panels chosen on a big screen, then the window goes down to its 900px minimum.
+        assert_eq!(super::fit_widths(900., (440., 680.)), (200., 300.));
+        // Small overflow: only the right panel gives way.
+        assert_eq!(super::fit_widths(1320., (256., 680.)), (256., 644.));
+        // Enough room: untouched.
+        assert_eq!(super::fit_widths(1600., (256., 380.)), (256., 380.));
+    }
+
     #[test]
     fn repo_name() {
         assert_eq!(super::repo_name("https://github.com/a/b.git"), Some("b"));

@@ -67,8 +67,7 @@ pub fn icon_button(id: impl Into<ElementId>, icon: impl Into<Icon>) -> Button {
 pub fn avatar(name: &str, size: f32) -> impl IntoElement + use<> {
     let p = pal();
     let initials: String = name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect::<String>().to_uppercase();
-    let hash = name.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
-    let color = p.lanes[(hash >> 32) as usize % p.lanes.len()];
+    let color = p.lanes[crate::graph::color_index(name.as_bytes()) % p.lanes.len()];
     div()
         .size(px(size))
         .flex_none()

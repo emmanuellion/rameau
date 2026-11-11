@@ -19,9 +19,18 @@ pub fn build(path: &str, lines: &[DiffLine], selected: impl Fn(usize) -> bool, r
         let (old_start, new_start) = (lines[i].old.unwrap_or(1), lines[i].new.unwrap_or(1));
         let mut body = String::new();
         let mut changed = false;
+        // Whether the previous diff line made it into the patch: its "no newline" marker follows it.
+        let mut previous_kept = false;
         i += 1;
         while i < lines.len() && lines[i].kind != LineKind::Hunk {
             let l = &lines[i];
+            if l.kind == LineKind::NoNewline {
+                if previous_kept {
+                    body.push_str("\\ No newline at end of file\n");
+                }
+                i += 1;
+                continue;
+            }
             let keep = selected(i);
             let prefix = match (l.kind, keep, reverse) {
                 (LineKind::Context, _, _) => Some(' '),
@@ -32,6 +41,7 @@ pub fn build(path: &str, lines: &[DiffLine], selected: impl Fn(usize) -> bool, r
                 (LineKind::Removed, false, false) | (LineKind::Added, false, true) => Some(' '),
                 _ => None,
             };
+            previous_kept = prefix.is_some();
             if let Some(p) = prefix {
                 changed |= p != ' ';
                 body.push(p);
@@ -93,6 +103,27 @@ mod tests {
 
         // Nothing selected: no patch.
         assert!(build("f", &lines, |_| false, true).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_line_without_newline() {
+        let dir = std::env::temp_dir().join(format!("rameau-patch-eof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        sh(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("f"), "a\nb").unwrap();
+        sh(&dir, &["add", "f"]);
+        sh(&dir, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        std::fs::write(dir.join("f"), "a\nB").unwrap();
+        let repo = git2::Repository::open(&dir).unwrap();
+
+        // Stage every changed line: the index must then match the file exactly.
+        let (lines, _) = repo::file_diff(&repo, &DiffSource::Unstaged, "f").unwrap();
+        let changed = |i: usize| matches!(lines[i].kind, LineKind::Added | LineKind::Removed);
+        let p = build("f", &lines, changed, false).unwrap();
+        git::exec(&dir, &["apply", "--cached", "--recount", "-"], Some(&p), None, &[]).unwrap();
+        assert_eq!(git::run(&dir, &["diff", "--stat"]).unwrap(), "", "index differs from the file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

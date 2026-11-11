@@ -34,6 +34,31 @@ const HASH_W: f32 = 64.;
 // shortcut: wider graphs are clipped; make the graph column resizable if repos need it.
 const MAX_GRAPH_LANES: usize = 14;
 
+/// Height of every sidebar line (headers included): the list is virtualized.
+const SIDE_ROW_H: f32 = 32.;
+
+/// A line of the sidebar: group header (group index, item count), branch or stash index.
+#[derive(Clone, Copy)]
+enum SideItem {
+    Header(usize, usize),
+    Branch(usize),
+    Stash(usize),
+}
+
+struct Group {
+    key: &'static str,
+    title: &'static str,
+    icon: &'static str,
+    /// Some(remote?) for branches, None for stashes.
+    remote: Option<bool>,
+}
+
+const GROUPS: [Group; 3] = [
+    Group { key: "branches", title: "Branches", icon: "git-branch", remote: Some(false) },
+    Group { key: "remotes", title: "Distantes", icon: "cloud", remote: Some(true) },
+    Group { key: "stashes", title: "Stashs", icon: "archive", remote: None },
+];
+
 fn project_name(path: &std::path::Path) -> String {
     path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
@@ -161,7 +186,7 @@ impl Rameau {
                     .when(behind > 0, |b| b.child(badge(behind, false)))
                     .disabled(busy)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.run(GitJob::new("Pull", &["pull", "--no-edit"]).done("Pull terminé"), window, cx)
+                        this.pull(window, cx)
                     })),
             )
             .child(
@@ -217,15 +242,13 @@ impl Rameau {
             })
     }
 
-    /// Foldable sidebar section header. Returns whether the section is open.
-    fn section_header(&self, key: &'static str, title: &'static str, ico: Icon, count: usize, cx: &mut Context<Self>) -> (impl IntoElement, bool) {
+    /// Foldable sidebar section header.
+    fn section_header(&self, key: &'static str, title: &'static str, ico: Icon, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal();
         let open = !self.config.collapsed.iter().any(|k| k == key);
         let header = div()
             .id(key)
             .mx_2()
-            .mt_3()
-            .mb_0p5()
             .px_2()
             .h(px(28.))
             .flex()
@@ -244,33 +267,51 @@ impl Rameau {
             .child(div().flex_1().text_xs().font_weight(gpui::FontWeight::SEMIBOLD).text_color(c(p.muted)).child(title))
             .child(badge(count, false))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_section(key, cx)));
-        (header, open)
+        header
     }
 
-    fn sidebar(&self, pr: &Project, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Sidebar lines, in order: a header per non-empty group, then its rows when unfolded.
+    fn side_items(&self, pr: &Project) -> Vec<SideItem> {
+        let h = &pr.history;
+        let mut items = Vec::new();
+        for (g, group) in GROUPS.iter().enumerate() {
+            let members: Vec<SideItem> = match group.remote {
+                Some(remote) => h
+                    .branches
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| (b.kind == RefKind::Remote) == remote)
+                    .map(|(i, _)| SideItem::Branch(i))
+                    .collect(),
+                None => (0..h.stashes.len()).map(SideItem::Stash).collect(),
+            };
+            if members.is_empty() {
+                continue;
+            }
+            items.push(SideItem::Header(g, members.len()));
+            if !self.config.collapsed.iter().any(|k| k == group.key) {
+                items.extend(members);
+            }
+        }
+        items
+    }
+
+    fn side_item(&self, pr: &Project, item: SideItem, cx: &mut Context<Self>) -> AnyElement {
         let p = pal();
         let h = &pr.history;
         let selected_id = match self.selection {
             Selection::Commit(id) => Some(id),
             _ => None,
         };
-        let mut list = div().id("branches").flex_1().overflow_y_scroll().pb_4();
-        let groups: [(&'static str, &'static str, Icon, bool); 2] = [
-            ("branches", "Branches", icon("git-branch"), false),
-            ("remotes", "Distantes", icon("cloud"), true),
-        ];
-        for (key, title, ico, remote) in groups {
-            let items: Vec<_> = h.branches.iter().enumerate().filter(|(_, b)| (b.kind == RefKind::Remote) == remote).collect();
-            if items.is_empty() {
-                continue;
+        // Every line is SIDE_ROW_H tall: the list only builds the visible ones.
+        let line = div().h(px(SIDE_ROW_H)).flex().flex_col().justify_end();
+        match item {
+            SideItem::Header(g, count) => {
+                let group = &GROUPS[g];
+                line.child(self.section_header(group.key, group.title, icon(group.icon), count, cx)).into_any_element()
             }
-            let (header, open) = self.section_header(key, title, ico, items.len(), cx);
-            list = list.child(header);
-            if !open {
-                continue;
-            }
-            let mut rows = div();
-            for (i, b) in items {
+            SideItem::Branch(i) => {
+                let b = &h.branches[i];
                 let color = b.row.map_or(c(p.faint), |r| lane_color(h.rows[r].color));
                 let row = b.row;
                 let is_head = b.kind == RefKind::Head;
@@ -281,7 +322,7 @@ impl Rameau {
                     RefKind::Remote => b.name.split_once('/').map_or(("", b.name.as_str()), |(r, n)| (r, n)),
                     _ => ("", b.name.as_str()),
                 };
-                rows = rows.child(
+                line.child(
                     sidebar_row(("branch", i), selected)
                         .child(div().size(px(8.)).rounded_full().flex_none().bg(color))
                         .child(
@@ -309,29 +350,40 @@ impl Rameau {
                                 this.select_commit(id, cx);
                             }
                         })),
-                );
+                )
+                .into_any_element()
             }
-            list = list.child(appear(rows, ("section-in", crate::ui::key(key)), -4., 0.));
-        }
-        if !h.stashes.is_empty() {
-            let (header, open) = self.section_header("stashes", "Stashs", icon("archive"), h.stashes.len(), cx);
-            list = list.child(header);
-            let mut rows = div();
-            for s in h.stashes.iter().filter(|_| open) {
-                let (id, index) = (s.id, s.index);
-                rows = rows.child(
+            SideItem::Stash(i) => {
+                let st = &h.stashes[i];
+                let (id, index) = (st.id, st.index);
+                line.child(
                     sidebar_row(("stash", index), selected_id == Some(id))
                         .child(div().flex_none().text_xs().font_family(mono()).text_color(c(p.faint)).child(format!("{{{index}}}")))
-                        .child(div().flex_1().truncate().text_sm().text_color(c(p.muted)).child(s.message.clone()))
+                        .child(div().flex_1().truncate().text_sm().text_color(c(p.muted)).child(st.message.clone()))
                         .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, _| this.menu_target = Some(MenuTarget::Stash(index))))
                         .on_click(cx.listener(move |this, _, _, cx| this.select_commit(id, cx))),
-                );
-            }
-            if open {
-                list = list.child(appear(rows, "stashes-in", -4., 0.));
+                )
+                .into_any_element()
             }
         }
+    }
+
+    fn sidebar(&self, pr: &Project, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = pal();
         let weak = cx.weak_entity();
+        // Virtualized like the history: repositories with thousands of remote branches stay
+        // smooth, even while the busy spinner redraws the window every frame.
+        let list = uniform_list(
+            "sidebar-items",
+            self.side_items(pr).len(),
+            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                let Some(pr) = &this.proj else { return vec![] };
+                let items = this.side_items(pr);
+                range.filter_map(|ix| items.get(ix).map(|item| this.side_item(pr, *item, cx))).collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .pb_4();
         div()
             .id("sidebar")
             .w(px(self.sidebar_w()))
@@ -342,12 +394,19 @@ impl Rameau {
             .border_r_1()
             .border_color(c(p.border))
             .child(
-                list.capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, _| {
-                    if e.button == MouseButton::Right {
-                        this.menu_target = None;
-                    }
-                }))
-                .context_menu(move |menu, _, cx| Self::build_menu(&weak, menu, cx)),
+                div()
+                    .id("branches")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(list)
+                    .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, _| {
+                        if e.button == MouseButton::Right {
+                            this.menu_target = None;
+                        }
+                    }))
+                    .context_menu(move |menu, _, cx| Self::build_menu(&weak, menu, cx)),
             )
             .child(self.account(cx))
     }
@@ -676,7 +735,7 @@ impl Rameau {
                         })
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             cx.stop_propagation();
-                            this.run(GitJob::owned(if checked { "Retrait" } else { "Ajout" }, args.clone()), window, cx);
+                            this.run(GitJob::owned(if checked { "Retrait" } else { "Ajout" }, args.clone()).status_only(), window, cx);
                         })),
                 )
             })
@@ -704,10 +763,7 @@ impl Rameau {
                     .child(div().flex_none().text_color(c(p.text)).child(name.to_owned()))
                     .child(div().min_w_0().truncate().text_xs().pt_0p5().text_color(c(p.faint)).child(dir.to_owned())),
             )
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.open_diff(source.clone(), pth.clone());
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_diff(source.clone(), pth.clone(), false, cx)))
     }
 
     fn changes_panel(&self, pr: &Project, cx: &mut Context<Self>) -> impl IntoElement {
@@ -728,7 +784,7 @@ impl Rameau {
                     button_sm(id)
                         .ghost()
                         .label(text)
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.run(GitJob::new(text, args), window, cx)))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.run(GitJob::new(text, args).status_only(), window, cx)))
                 }))
         };
         let path_args = |cmd: &[&str], path: &str| cmd.iter().map(|s| s.to_string()).chain([path.to_owned()]).collect::<Vec<_>>();
@@ -1106,8 +1162,9 @@ fn paint_graph(bounds: Bounds<Pixels>, row: &Row, is_merge: bool, window: &mut W
 impl Render for Rameau {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal();
+        self.viewport_w = f32::from(window.viewport_size().width);
         let right_w = if self.selection == Selection::None { 0. } else { self.panel_w() };
-        self.center_w = f32::from(window.viewport_size().width) - self.sidebar_w() - right_w;
+        self.center_w = self.viewport_w - self.sidebar_w() - right_w;
         let body: AnyElement = match (&self.proj, self.page) {
             (_, Page::Import) | (None, _) if !self.loading => self.import_page(cx).into_any_element(),
             (None, _) => div().flex_1().flex().items_center().justify_center().text_sm().text_color(c(p.muted)).child("Chargement…").into_any_element(),
@@ -1145,7 +1202,7 @@ impl Render for Rameau {
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.move_selection(-1, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_selection(1, cx)))
             .on_action(cx.listener(|this, _: &CloseDiff, _, cx| {
-                this.diff = None;
+                this.close_diff();
                 cx.notify();
             }))
             // Drop a folder anywhere to import it.

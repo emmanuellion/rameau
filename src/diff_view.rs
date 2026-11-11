@@ -21,7 +21,7 @@ use crate::theme::{self, alpha, c, mono, pal};
 use crate::ui::{appear, button_sm, key};
 
 const LINE_H: f32 = 22.;
-// shortcut: no syntax colors for files over 1 MB, highlighting runs on the UI thread.
+// No syntax colors over 1 MB: on such files (generated, minified) colors cost more time than they help.
 const MAX_HIGHLIGHT_BYTES: usize = 1 << 20;
 
 type Styles = Vec<(Range<usize>, HighlightStyle)>;
@@ -161,7 +161,7 @@ impl Rameau {
             })
             .child(button_sm("close-diff").icon(IconName::Close).label("Fermer").ghost().on_click(cx.listener(
                 |this, _: &ClickEvent, _, cx| {
-                    this.diff = None;
+                    this.close_diff();
                     cx.notify();
                 },
             )));
@@ -207,7 +207,7 @@ fn diff_line(d: &OpenDiff, ix: usize, cx: &mut Context<Rameau>) -> AnyElement {
         LineKind::Added => (Some(alpha(p.green, 0.13)), "+", p.green),
         LineKind::Removed => (Some(alpha(p.red, 0.13)), "-", p.red),
         LineKind::Hunk => (Some(alpha(p.accent, 0.08)), "", p.accent),
-        LineKind::Info => (None, "", p.muted),
+        LineKind::Info | LineKind::NoNewline => (None, "", p.muted),
         LineKind::Context => (None, "", p.faint),
     };
     let selected = d.selected.contains(&ix);

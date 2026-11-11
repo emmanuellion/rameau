@@ -20,7 +20,6 @@ pub struct Config {
 /// `~/Library/Application Support/rameau` on macOS, `$XDG_CONFIG_HOME/rameau` (or `~/.config/rameau`)
 /// on Linux, `%APPDATA%\rameau` on Windows.
 pub fn dir() -> PathBuf {
-    let home = || PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let base = if cfg!(target_os = "macos") {
         home().join("Library/Application Support")
     } else if cfg!(target_os = "windows") {
@@ -37,19 +36,28 @@ pub fn home() -> PathBuf {
 
 impl Config {
     pub fn load() -> Self {
-        std::fs::read(dir().join("config.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        Self::load_from(&dir().join("config.json"))
+    }
+
+    fn load_from(path: &Path) -> Self {
+        std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
     pub fn save(&self) {
-        let dir = dir();
-        let result = std::fs::create_dir_all(&dir)
-            .and_then(|_| std::fs::write(dir.join("config.json"), serde_json::to_vec_pretty(self).unwrap_or_default()));
-        if let Err(e) = result {
+        if let Err(e) = self.save_to(&dir().join("config.json")) {
             eprintln!("rameau: impossible d'enregistrer la configuration : {e}");
         }
+    }
+
+    /// Writes a temp file, then renames it over the config: if the app dies mid-write,
+    /// the previous config is still whole (a half-written one would be read as empty).
+    fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::rename(&tmp, path)
     }
 
     pub fn add(&mut self, path: &Path) {
@@ -64,5 +72,30 @@ impl Config {
         if self.last.as_deref() == Some(path) {
             self.last = self.projects.first().cloned();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_replaces_the_file_whole() {
+        let dir = crate::app::tests::temp("config");
+        let path = dir.join("config.json");
+        let mut config = Config::default();
+        config.add(Path::new("/projets/a"));
+        config.light = true;
+        config.save_to(&path).unwrap();
+        // A write interrupted earlier left garbage in the temp file: the saved config is unaffected.
+        std::fs::write(path.with_extension("json.tmp"), "{\"projects\": [").unwrap();
+        let back = Config::load_from(&path);
+        assert_eq!(back.projects, [PathBuf::from("/projets/a")]);
+        assert!(back.light);
+        // And the next save goes through.
+        config.add(Path::new("/projets/b"));
+        config.save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path).projects.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

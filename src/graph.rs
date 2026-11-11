@@ -28,6 +28,12 @@ pub struct Row {
 /// Number of lane colors in the UI palette.
 pub const PALETTE: usize = 10;
 
+/// Stable color for a name (FNV-1a, high bits): names differing by one letter land on
+/// unrelated colors. Used for branch lanes and author avatars.
+pub fn color_index(bytes: &[u8]) -> usize {
+    (bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)) >> 32) as usize
+}
+
 /// `commits[i] = (id, parent ids)`. Ids are any comparable value (git Oids in the app).
 /// `color_of(id)` gives the color of a lane starting at `id`: deriving it from the commit
 /// (or its branch name) keeps colors stable when new commits arrive.

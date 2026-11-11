@@ -128,9 +128,7 @@ pub fn load(repo: &mut Repository) -> Result<History, git2::Error> {
         .iter()
         .filter_map(|(id, ls)| ls.iter().min_by_key(|l| l.kind as u8).map(|l| (*id, key(&l.name, l.kind))))
         .collect();
-    // FNV-1a, high bits: names differing by one letter land on unrelated colors.
-    let hash = |bytes: &[u8]| (bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)) >> 32) as usize;
-    let color_of = |id: &Oid| color_names.get(id).map_or_else(|| hash(id.as_bytes()), |n| hash(n.as_bytes()));
+    let color_of = |id: &Oid| color_names.get(id).map_or_else(|| graph::color_index(id.as_bytes()), |n| graph::color_index(n.as_bytes()));
 
     let mut walk = repo.revwalk()?;
     walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
@@ -198,7 +196,7 @@ impl Changes {
     }
 }
 
-fn changes(repo: &Repository) -> Result<Changes, git2::Error> {
+pub fn changes(repo: &Repository) -> Result<Changes, git2::Error> {
     let mut out = Changes::default();
     if repo.is_bare() {
         return Ok(out);
@@ -243,6 +241,8 @@ pub enum LineKind {
     Removed,
     Hunk,
     Info,
+    /// "\ No newline at end of file", about the line just above.
+    NoNewline,
 }
 
 pub struct DiffLine {
@@ -277,10 +277,15 @@ pub fn file_diff(repo: &Repository, source: &DiffSource, path: &str) -> Result<(
             '-' => LineKind::Removed,
             'H' => LineKind::Hunk,
             'B' => LineKind::Info,
-            _ => return true, // file headers and "no newline" markers
+            '=' | '>' | '<' => LineKind::NoNewline,
+            _ => return true, // file headers
         };
         // Raw text (tabs, \r kept): patches built from these lines must match the file exactly.
-        let text = String::from_utf8_lossy(l.content()).trim_end_matches('\n').to_owned();
+        let text = match kind {
+            // Shown in the diff only; patches write git's own marker.
+            LineKind::NoNewline => "Pas de retour à la ligne à la fin du fichier".to_owned(),
+            _ => String::from_utf8_lossy(l.content()).trim_end_matches('\n').to_owned(),
+        };
         let (old, new) = match (kind, hunk) {
             (LineKind::Hunk, Some(h)) => (Some(h.old_start()), Some(h.new_start())),
             _ => (l.old_lineno(), l.new_lineno()),
@@ -396,4 +401,81 @@ pub fn relative_time(t: i64) -> String {
     };
     let plural = if unit == "an" && n > 1 { "s" } else { "" };
     format!("il y a {n} {unit}{plural}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::{git, temp};
+
+    #[test]
+    fn changes_are_split_like_git_status() {
+        let dir = temp("status");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        for f in ["a", "b", "c", "k"] {
+            std::fs::write(dir.join(f), "1\n").unwrap();
+        }
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "init"]);
+        // A conflict on k: changed differently on two branches, then merged.
+        git(&dir, &["switch", "-qc", "x"]);
+        std::fs::write(dir.join("k"), "x\n").unwrap();
+        git(&dir, &["commit", "-qam", "x"]);
+        git(&dir, &["switch", "-q", "main"]);
+        std::fs::write(dir.join("k"), "main\n").unwrap();
+        git(&dir, &["commit", "-qam", "main"]);
+        assert!(crate::git::run(&dir, &["merge", "x"]).is_err());
+        // Then every other kind of change.
+        std::fs::write(dir.join("a"), "2\n").unwrap(); // modified, not staged
+        std::fs::write(dir.join("b"), "2\n").unwrap(); // modified and staged
+        git(&dir, &["add", "b"]);
+        std::fs::remove_file(dir.join("c")).unwrap(); // deleted, not staged
+        std::fs::write(dir.join("n"), "new\n").unwrap(); // untracked
+        std::fs::write(dir.join("s"), "new\n").unwrap(); // new and staged
+        git(&dir, &["add", "s"]);
+
+        let ch = changes(&Repository::open(&dir).unwrap()).unwrap();
+        let mut staged = ch.staged.clone();
+        let mut unstaged = ch.unstaged.clone();
+        staged.sort();
+        unstaged.sort();
+        assert_eq!(staged, [('A', "s".to_owned()), ('M', "b".to_owned())]);
+        assert_eq!(unstaged, [('A', "n".to_owned()), ('D', "c".to_owned()), ('M', "a".to_owned())]);
+        assert_eq!(ch.conflicted, ["k"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rebase_range_picks_commits_and_refuses_merges() {
+        let dir = temp("rebase-range");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        let commit = |name: &str| {
+            std::fs::write(dir.join(name), name).unwrap();
+            git(&dir, &["add", name]);
+            git(&dir, &["commit", "-qm", name]);
+            git(&dir, &["rev-parse", "HEAD"])
+        };
+        let oid = |s: String| Oid::from_str(s.trim()).unwrap();
+        let c1 = oid(commit("c1"));
+        let c2 = oid(commit("c2"));
+        commit("c3");
+        let repo = || Repository::open(&dir).unwrap();
+
+        let (base, list) = rebase_range(&repo(), c2).unwrap();
+        assert_eq!(base, Some(c1));
+        let names: Vec<_> = list.iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(names, ["c2", "c3"], "oldest first");
+        // From the very first commit: rebase from the root.
+        assert_eq!(rebase_range(&repo(), c1).unwrap().0, None);
+
+        // A commit outside the current branch is refused.
+        git(&dir, &["switch", "-qc", "other", "HEAD~2"]);
+        let other = oid(commit("o"));
+        git(&dir, &["switch", "-q", "main"]);
+        assert!(rebase_range(&repo(), other).is_err());
+        // A range containing a merge is refused.
+        git(&dir, &["merge", "-q", "--no-edit", "other"]);
+        assert!(rebase_range(&repo(), c2).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
