@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rameau
+GenericName=Client git
+Comment=Client git graphique rapide
+Exec=rameau %F
+Icon=rameau
+Terminal=false
+Categories=Development;RevisionControl;
+StartupWMClass=rameau

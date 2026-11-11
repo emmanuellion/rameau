@@ -1,0 +1,3 @@
+# Public id of the Rameau GitHub OAuth App (device flow). Not a secret: it ships in every binary.
+[env]
+RAMEAU_GITHUB_CLIENT_ID = "Ov23liQTxeRmIG3wPQF6"

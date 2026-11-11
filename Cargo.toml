@@ -1,0 +1,38 @@
+[package]
+name = "rameau"
+version = "0.1.0"
+edition = "2024"
+description = "Client git graphique rapide, en Rust et GPUI"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/emmanuellion/rameau"
+homepage = "https://github.com/emmanuellion/rameau"
+readme = "README.md"
+
+[dependencies]
+# runtime_shaders: compile Metal shaders at launch, so no full Xcode is needed to build
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+# no https/ssh: git2 only reads locally; network ops go through the git CLI (user's ssh/credentials)
+git2 = { version = "0.20", default-features = false }
+# 0.5.x is the last line built on gpui 0.2.2
+# tree-sitter-languages: syntax highlighting in diffs
+gpui-component = { version = "0.5.1", features = ["tree-sitter-languages"] }
+# Icons used by components (title bar window controls on Linux, menus, notifications)
+gpui-component-assets = "0.5.1"
+# GitHub device-flow login
+ureq = { version = "3", features = ["json"] }
+serde_json = "1"
+# Saved projects and preferences
+serde = { version = "1", features = ["derive"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# Distributed builds: smaller binary, a bit faster.
+[profile.release]
+strip = true
+lto = "thin"
+
+# shortcut: gpui 0.2.2 pulls xattr 0.2.3 (via its http client), which uses libc::ENOATTR,
+# removed from libc 0.2.190 on Linux. Drop this pin when moving to a newer gpui.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.189"

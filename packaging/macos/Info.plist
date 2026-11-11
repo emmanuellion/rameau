@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Rameau</string>
+    <key>CFBundleDisplayName</key>
+    <string>Rameau</string>
+    <key>CFBundleIdentifier</key>
+    <string>dev.lioncore.rameau</string>
+    <key>CFBundleExecutable</key>
+    <string>rameau</string>
+    <key>CFBundleIconFile</key>
+    <string>rameau</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Rameau lit et modifie les dépôts git que vous ouvrez dans ce dossier.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Rameau lit et modifie les dépôts git que vous ouvrez dans ce dossier.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Rameau lit et modifie les dépôts git que vous ouvrez dans ce dossier.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Rameau lit et modifie les dépôts git que vous ouvrez dans ce dossier.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>Rameau lit et modifie les dépôts git que vous ouvrez dans ce dossier.</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>GPL-3.0-or-later</string>
+</dict>
+</plist>
