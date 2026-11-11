@@ -14,11 +14,11 @@ use gpui_component::{
     menu::{ContextMenu, ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
 };
 
-use crate::app::{CloseDiff, GitJob, Login, MenuTarget, Page, Project, Rameau, SelectNext, SelectPrev, Selection, Side, View};
+use crate::app::{CloseDiff, Fetch, FocusSearch, Pull, Push, Refresh, ShowChanges, ShowHistory, GitJob, Login, MenuTarget, Page, Project, Rameau, SelectNext, SelectPrev, Selection, Side, View};
 use crate::graph::{Half, Row};
 use crate::repo::{Check, DiffSource, FileEntry, RefKind, RefLabel};
 use crate::theme::{alpha, c, lane_color, mono, pal, status_color};
-use crate::ui::{appear, avatar, button, button_sm, icon, icon_button, key};
+use crate::ui::{appear, avatar, button, button_sm, icon, icon_button, kbd, key};
 
 use std::f32::consts::FRAC_PI_2;
 use std::time::Duration;
@@ -193,10 +193,8 @@ impl Rameau {
                     .icon(icon("refresh-cw"))
                     .label("Fetch")
                     .disabled(busy)
-                    .tooltip("Récupérer les nouveautés du serveur sans toucher à tes fichiers")
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.run(GitJob::new("Fetch", &["fetch", "--all", "--prune"]).network(), window, cx)
-                    })),
+                    .tooltip(format!("Récupérer les nouveautés du serveur sans toucher à tes fichiers ({}). Fait aussi toutes les 5 minutes.", kbd("F", true)))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.fetch(window, cx))),
             )
             .child(
                 button("pull")
@@ -204,6 +202,7 @@ impl Rameau {
                     .icon(IconName::ArrowDown)
                     .label("Pull")
                     .when(behind > 0, |b| b.child(badge(behind, false)))
+                    .tooltip(format!("Récupérer et intégrer les commits du serveur ({})", kbd("P", true)))
                     .disabled(busy)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.pull(window, cx)
@@ -217,8 +216,9 @@ impl Rameau {
                     .when(push_primary, |b| b.primary())
                     .when(!push_primary, |b| b.ghost())
                     .when(matches!(self.login, Login::Out), |b| {
-                        b.tooltip("Envoyer tes commits. Vers GitHub : connecte-toi (en haut à droite), ou utilise tes identifiants git habituels.")
+                        b.tooltip(format!("Envoyer tes commits ({}). Vers GitHub : connecte-toi (en haut à droite), ou utilise tes identifiants git habituels.", kbd("P", false)))
                     })
+                    .when(!matches!(self.login, Login::Out), |b| b.tooltip(format!("Envoyer tes commits ({})", kbd("P", false))))
                     .disabled(busy || h.head_branch.is_none() || !h.has_commits)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.push(window, cx))),
             )
@@ -642,8 +642,8 @@ impl Rameau {
         let hint = match (op.cont, conflicts) {
             (None, _) => "Recherche du commit fautif lancée dans un terminal : continue-la là-bas, ou arrête-la ici.".to_owned(),
             (Some(_), 0) => "Conflits résolus : tu peux continuer.".to_owned(),
-            (Some(_), 1) => "1 conflit à résoudre : corrige le fichier puis coche-le.".to_owned(),
-            (Some(_), n) => format!("{n} conflits à résoudre : corrige les fichiers puis coche-les."),
+            (Some(_), 1) => "1 fichier en conflit : choisis une version pour chaque bloc dans son diff, ou corrige-le dans ton éditeur puis coche-le.".to_owned(),
+            (Some(_), n) => format!("{n} fichiers en conflit : choisis une version pour chaque bloc dans leur diff, ou corrige-les dans ton éditeur puis coche-les."),
         };
         let words = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let (title, cont, abort, bisect) = (op.title, op.cont.map(words), words(op.abort), op.cont.is_none());
@@ -884,7 +884,8 @@ impl Rameau {
                     .text_color(c(p.faint))
                     .hover(|s| s.border_color(c(p.muted)))
                     .child(Icon::new(IconName::Search).small().text_color(c(p.faint)))
-                    .child("Rechercher un commit : message, auteur ou hash")
+                    .child(div().flex_1().child("Rechercher un commit : message, auteur ou hash"))
+                    .child(div().text_xs().child(kbd("F", false)))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_search(window, cx)))
                     .into_any_element()
             }))
@@ -1384,13 +1385,44 @@ impl Rameau {
             Some(MenuTarget::Commit(id)) => {
                 let (full, short) = (id.to_string(), id.to_string()[..7].to_owned());
                 let copy = full.clone();
-                menu.item(git(format!("Checkout {short} (HEAD détachée)"), "Checkout", args(&["switch", "--detach", &full])))
+                let is_head = pr.repo.head().ok().and_then(|h| h.target()) == Some(id);
+                // A merge commit is picked or reverted against its first parent (the branch it was merged into).
+                let merge = pr.repo.find_commit(id).is_ok_and(|c| c.parent_count() > 1);
+                let pick_args = |cmd: &[&str]| {
+                    let mut a = args(cmd);
+                    if merge {
+                        a.extend(["-m".into(), "1".into()]);
+                    }
+                    a.push(full.clone());
+                    a
+                };
+                let no_branch = pr.history.head_branch.is_none();
+                let tags: Vec<String> =
+                    pr.history.commits.iter().find(|c| c.id == id).map(|c| c.refs.iter().filter(|r| r.kind == RefKind::Tag).map(|r| r.name.clone()).collect()).unwrap_or_default();
+                let reset = |label: String, mode: &'static str| act(label, std::rc::Rc::new(move |this, w, cx| this.reset_to(id, mode, w, cx))).disabled(is_head || no_branch);
+                let mut menu = menu
+                    .item(git(format!("Checkout {short} (HEAD détachée)"), "Checkout", args(&["switch", "--detach", &full])))
                     .item(act("Nouvelle branche ici…".into(), std::rc::Rc::new(move |this, w, cx| this.new_branch_dialog(id, w, cx))))
                     .separator()
                     .item(git(format!("Merger {short} dans {head}"), "Merge", args(&["merge", "--no-edit", &full])))
                     .item(git(format!("Rebaser {head} sur {short}"), "Rebase", args(&["rebase", "--autostash", &full])))
                     .item(act("Rebase interactif à partir d'ici…".into(), std::rc::Rc::new(move |this, w, cx| this.interactive_rebase(id, w, cx))))
                     .separator()
+                    .item(git(format!("Cherry-pick {short} sur {head}"), "Cherry-pick", pick_args(&["cherry-pick"])).disabled(is_head))
+                    .item(git(format!("Revert {short} (commit inverse)"), "Revert", pick_args(&["revert", "--no-edit"])))
+                    .separator()
+                    .item(reset(format!("Reset {head} ici : garder les modifications cochées"), "soft"))
+                    .item(reset(format!("Reset {head} ici : garder les modifications"), "mixed"))
+                    .item(reset(format!("Reset {head} ici : tout abandonner…"), "hard"))
+                    .separator()
+                    .item(act("Nouveau tag ici…".into(), std::rc::Rc::new(move |this, w, cx| this.new_tag_dialog(id, w, cx))));
+                for tag in tags {
+                    let t = tag.clone();
+                    menu = menu
+                        .item(act(format!("Publier le tag {tag}"), std::rc::Rc::new(move |this, w, cx| this.push_tag(t.clone(), w, cx))))
+                        .item(act(format!("Supprimer le tag {tag}…"), std::rc::Rc::new(move |this, w, cx| this.delete_tag(tag.clone(), w, cx))));
+                }
+                menu.separator()
                     .item(PopupMenuItem::new("Copier le hash").icon(IconName::Copy).on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))))
             }
             Some(MenuTarget::Branch(name, kind)) => {
@@ -1423,6 +1455,13 @@ impl Rameau {
                             this.confirm(format!("Supprimer {drop_ref} ?"), msg, "Supprimer", job, w, cx)
                         }),
                     ))
+            }
+            Some(MenuTarget::File(path, _)) if pr.history.changes.conflicted.contains(&path) => {
+                let (p1, p2) = (path.clone(), path.clone());
+                menu.item(act("Garder la version HEAD".into(), std::rc::Rc::new(move |this, w, cx| this.resolve_file(p1.clone(), false, w, cx))))
+                    .item(act("Garder la version entrante".into(), std::rc::Rc::new(move |this, w, cx| this.resolve_file(p2.clone(), true, w, cx))))
+                    .separator()
+                    .item(PopupMenuItem::new("Copier le chemin").icon(IconName::Copy).on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(path.clone()))))
             }
             Some(MenuTarget::File(path, untracked)) => {
                 let p = path.clone();
@@ -1678,6 +1717,23 @@ impl Render for Rameau {
                         this.close_diff();
                         cx.notify();
                     }))
+                    .when(self.proj.is_some() && self.page == Page::Repo, |d| {
+                        d.on_action(cx.listener(|this, _: &ShowChanges, _, cx| this.set_view(View::Changes, cx)))
+                            .on_action(cx.listener(|this, _: &ShowHistory, _, cx| this.set_view(View::History, cx)))
+                            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                                this.set_view(View::History, cx);
+                                this.open_search(window, cx);
+                            }))
+                            .on_action(cx.listener(|this, _: &Fetch, window, cx| this.fetch(window, cx)))
+                            .on_action(cx.listener(|this, _: &Pull, window, cx| this.pull(window, cx)))
+                            .on_action(cx.listener(|this, _: &Push, window, cx| {
+                                // Same conditions as the Push button.
+                                if this.history().is_some_and(|h| h.head_branch.is_some() && h.has_commits) {
+                                    this.push(window, cx);
+                                }
+                            }))
+                            .on_action(cx.listener(|this, _: &Refresh, window, cx| this.reload(window, cx)))
+                    })
                     .child(body),
                 ("page", key((self.page == Page::Import, self.dir(), self.config.light))),
                 0.,

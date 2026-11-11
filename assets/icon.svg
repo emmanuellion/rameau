@@ -6,15 +6,17 @@
     </linearGradient>
   </defs>
   <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <!-- Lanes 150 apart (362, 512, 662); each fork leaves its parent from a straight stretch,
+       with the same S-curve. Children first so the parent line covers the joint. -->
   <g fill="none" stroke-width="54" stroke-linecap="round">
-    <path d="M400 800 V230" stroke="#5ab0f6"/>
-    <path d="M400 690 C400 590 620 600 620 500 V330" stroke="#f0719b"/>
-    <path d="M620 560 C620 500 760 500 760 430" stroke="#7bd88f"/>
+    <path d="M512 520 C512 450 662 450 662 380" stroke="#7bd88f"/>
+    <path d="M362 700 C362 630 512 630 512 560 V320" stroke="#f0719b"/>
+    <path d="M362 790 V236" stroke="#5ab0f6"/>
   </g>
   <g stroke="#12141a" stroke-width="16">
-    <circle cx="400" cy="250" r="54" fill="#5ab0f6"/>
-    <circle cx="400" cy="780" r="54" fill="#5ab0f6"/>
-    <circle cx="620" cy="330" r="54" fill="#f0719b"/>
-    <circle cx="760" cy="420" r="48" fill="#7bd88f"/>
+    <circle cx="362" cy="236" r="54" fill="#5ab0f6"/>
+    <circle cx="362" cy="790" r="54" fill="#5ab0f6"/>
+    <circle cx="512" cy="320" r="54" fill="#f0719b"/>
+    <circle cx="662" cy="380" r="54" fill="#7bd88f"/>
   </g>
 </svg>

@@ -51,6 +51,16 @@ pub fn icon(name: &str) -> Icon {
     Icon::empty().path(format!("icons/rameau/{name}.svg"))
 }
 
+/// A keyboard shortcut as the platform writes it: `kbd("P", true)` is ⌘⇧P on macOS, Ctrl+Maj+P elsewhere.
+pub fn kbd(key: &str, shift: bool) -> String {
+    match (cfg!(target_os = "macos"), shift) {
+        (true, true) => format!("⌘⇧{key}"),
+        (true, false) => format!("⌘{key}"),
+        (false, true) => format!("Ctrl+Maj+{key}"),
+        (false, false) => format!("Ctrl+{key}"),
+    }
+}
+
 /// Standard button: hand cursor, 32px tall, comfortable padding.
 /// No text style here: a text refinement on gpui-component buttons drops their text color.
 pub fn button(id: impl Into<ElementId>) -> Button {

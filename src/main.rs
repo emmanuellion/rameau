@@ -3,6 +3,7 @@
 
 mod app;
 mod config;
+mod conflict;
 mod diff_view;
 mod git;
 mod github;
@@ -19,7 +20,7 @@ use git2::Repository;
 use gpui::{App, AppContext, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions, point, px, size};
 use gpui_component::{Root, TitleBar};
 
-use app::{CloseDiff, Rameau, SelectNext, SelectPrev};
+use app::{CloseDiff, Fetch, FocusSearch, Pull, Push, Rameau, Refresh, SelectNext, SelectPrev, ShowChanges, ShowHistory};
 use config::Config;
 
 fn main() {
@@ -42,6 +43,15 @@ fn main() {
             KeyBinding::new("up", SelectPrev, Some("Rameau")),
             KeyBinding::new("down", SelectNext, Some("Rameau")),
             KeyBinding::new("escape", CloseDiff, Some("Rameau")),
+            // "secondary": ⌘ on macOS, Ctrl elsewhere. Shown in the tooltips (ui::shortcut).
+            KeyBinding::new("secondary-1", ShowChanges, Some("Rameau")),
+            KeyBinding::new("secondary-2", ShowHistory, Some("Rameau")),
+            KeyBinding::new("secondary-f", FocusSearch, Some("Rameau")),
+            KeyBinding::new("secondary-shift-f", Fetch, Some("Rameau")),
+            KeyBinding::new("secondary-shift-p", Pull, Some("Rameau")),
+            KeyBinding::new("secondary-p", Push, Some("Rameau")),
+            KeyBinding::new("secondary-r", Refresh, Some("Rameau")),
+            KeyBinding::new("f5", Refresh, Some("Rameau")),
         ]);
         // Never larger than the screen: at 150 % scaling, 1320×820 is taller than a 1080p display
         // and the bottom of the window (import page included) would be out of reach.

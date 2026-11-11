@@ -49,16 +49,19 @@ Environ deux fois moins de mémoire que GitHub Desktop, ouvert en 0,2 s. Sans El
 | **Modifier, annuler** | Modifier le dernier commit, ou l'annuler : ses modifications reviennent cochées, avec son message |
 | **Diffs** | Coloration syntaxique, changements mot à mot, vue unifiée ou côte à côte, par commit ou pour les modifications locales |
 | **Branches** | Checkout, merge, rebase, création, suppression locale ou sur le serveur (clic droit) |
+| **Commits** | Cherry-pick, revert, reset (soft, mixte, hard), créer, publier et supprimer des tags (clic droit) |
 | **Rebase interactif** | Réordonner, reformuler, fusionner ou supprimer des commits |
 | **Stash** | Créer, appliquer, supprimer |
-| **Conflits** | Bandeau « Merge/Rebase en cours » avec Continuer / Annuler |
+| **Conflits** | Choisir une version pour chaque bloc en conflit (HEAD, entrante, les deux) ou pour tout le fichier, puis Continuer / Annuler depuis le bandeau |
 | **GitHub** | Connexion par device flow, cloner un de tes dépôts depuis une liste, voir la pull request et le résultat de CI de chaque branche, ouvrir une pull request en un clic |
-| **Distant** | Push, pull, fetch |
+| **Distant** | Push, pull, fetch, fetch automatique toutes les 5 minutes |
 | **Projets** | Ouvrir un dossier, cloner une adresse, créer un dépôt, glisser-déposer ; passer d'un projet à l'autre |
 | **Confort** | Thème clair ou sombre, panneaux redimensionnables, identité git, abandon de modifications par fichier ou par ligne |
 
-Clavier : <kbd>↑</kbd> <kbd>↓</kbd> parcourir l'historique, <kbd>Échap</kbd> fermer le diff &nbsp;|&nbsp;
-<kbd>⌘</kbd>+<kbd>↩</kbd> (<kbd>Ctrl</kbd>+<kbd>↩</kbd> sous Linux/Windows) valider le commit.
+Clavier (<kbd>⌘</kbd> sur macOS, <kbd>Ctrl</kbd> sous Linux/Windows) : <kbd>↑</kbd> <kbd>↓</kbd> parcourir l'historique ou les fichiers modifiés,
+<kbd>Échap</kbd> fermer le diff, <kbd>⌘</kbd>+<kbd>↩</kbd> valider le commit, <kbd>⌘</kbd>+<kbd>1</kbd> / <kbd>2</kbd> modifications / historique,
+<kbd>⌘</kbd>+<kbd>F</kbd> rechercher, <kbd>⌘</kbd>+<kbd>P</kbd> push, <kbd>⌘</kbd>+<kbd>⇧</kbd>+<kbd>P</kbd> pull,
+<kbd>⌘</kbd>+<kbd>⇧</kbd>+<kbd>F</kbd> fetch, <kbd>⌘</kbd>+<kbd>R</kbd> ou <kbd>F5</kbd> actualiser.
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="assets/screenshots/commit-light.png">

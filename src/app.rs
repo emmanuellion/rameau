@@ -22,9 +22,12 @@ use gpui_component::{
 use crate::config::{self, Config};
 use crate::rebase::RebaseEditor;
 use crate::repo::{self, Details, DiffLine, DiffSource, History, LineKind, RefKind};
-use crate::{diff_view, git, github, patch, theme, ui};
+use crate::{conflict, diff_view, git, github, patch, theme, ui};
 
-actions!(rameau, [SelectPrev, SelectNext, CloseDiff]);
+actions!(rameau, [SelectPrev, SelectNext, CloseDiff, ShowChanges, ShowHistory, FocusSearch, Fetch, Pull, Push, Refresh]);
+
+/// Fetch in the background this often while a project is open: ahead/behind counts and CI stay current.
+const AUTO_FETCH: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 pub struct Project {
     pub path: PathBuf,
@@ -270,6 +273,15 @@ impl Rameau {
                 }
             }));
         }
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTO_FETCH).await;
+                if this.update_in(cx, |this, window, cx| this.auto_fetch(window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             let account = cx.background_executor().spawn(async { github::load() }).await;
             this.update(cx, |this, cx| {
@@ -612,8 +624,8 @@ impl Rameau {
     /// ↑/↓: walk the history.
     pub fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.want_avatars_later(cx);
-        if self.view != View::History {
-            return;
+        if self.view == View::Changes {
+            return self.move_file(delta, cx);
         }
         let Some(h) = self.history() else { return };
         let current = match self.selection {
@@ -629,6 +641,16 @@ impl Rameau {
         let Some(id) = self.history().and_then(|h| h.commits.get(next)).map(|c| c.id) else { return };
         self.scroll.scroll_to_item(next, ScrollStrategy::Top);
         self.select_commit(id, cx);
+    }
+
+    /// Changes view: ↑/↓ open the previous/next changed file.
+    fn move_file(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(files) = self.history().map(|h| &h.changes.files) else { return };
+        let current = self.diff.as_ref().filter(|d| !matches!(d.source, DiffSource::Commit(_))).and_then(|d| files.iter().position(|f| f.path == d.path));
+        let next = current.map_or(0, |i| i as isize + delta);
+        let Some(f) = usize::try_from(next).ok().and_then(|i| files.get(i)) else { return };
+        let (source, path) = (f.diff_source(), f.path.clone());
+        self.open_diff(source, path, false, cx);
     }
 
     /// Shows the commit at `row` of the history (a branch tip clicked in the sidebar).
@@ -924,6 +946,139 @@ impl Rameau {
             GitJob::new("Push", &["push", "-u", &push_remote(&p.repo), "HEAD"])
         };
         self.run(job.network().done("Push terminé"), window, cx);
+    }
+
+    pub fn fetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run(GitJob::new("Fetch", &["fetch", "--all", "--prune"]).network(), window, cx);
+    }
+
+    /// Timed fetch: silent (a laptop offline must not pile up errors), skipped while a command runs.
+    /// The history reloads only when a ref moved.
+    // shortcut: a Fetch clicked during a timed fetch can race it on the refs (git then says so); add a lock if that bites.
+    fn auto_fetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = &self.proj else { return };
+        if self.busy.is_some() || p.repo.remotes().map_or(true, |r| r.is_empty()) {
+            return;
+        }
+        let (dir, git_dir, known, token) = (p.path.clone(), p.repo.path().to_owned(), p.history.fingerprint, self.token());
+        let task = cx.background_executor().spawn(async move {
+            if let Err(e) = git::exec(&dir, &["fetch", "--all", "--prune", "--quiet"], None, token.as_deref(), &[]) {
+                eprintln!("rameau: fetch automatique : {e}");
+            }
+            Repository::open(&git_dir).map(|r| repo::fingerprint(&r) != known).unwrap_or(false)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let moved = task.await;
+            this.update_in(cx, |this, window, cx| {
+                // Another project opened meanwhile: its own load is on the way.
+                if this.proj.as_ref().is_some_and(|p| p.history.fingerprint == known) && moved {
+                    this.reload(window, cx);
+                }
+                this.refresh_github(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Moves the current branch to `at`. `mode`: soft, mixed or hard.
+    pub fn reset_to(&mut self, at: Oid, mode: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(h) = self.history() else { return };
+        let short = &at.to_string()[..7];
+        let job = GitJob::owned("Reset", vec!["reset".into(), format!("--{mode}"), at.to_string()]).done("Branche déplacée");
+        let lost = match mode {
+            "hard" => "Les modifications non commitées seront perdues définitivement, et",
+            _ => "Tes fichiers ne bougent pas, mais",
+        };
+        let published = if h.head_published { " Ils sont déjà sur le serveur : il faudra forcer le push." } else { "" };
+        let msg = format!("{lost} les commits de {} après {short} ne seront plus dans la branche.{published}", h.head);
+        let title = format!("Reset {} sur {short} ?", h.head);
+        if mode == "hard" || h.head_published {
+            self.confirm(title, msg, "Reset", job, window, cx);
+        } else {
+            self.run(job, window, cx);
+        }
+    }
+
+    pub fn new_tag_dialog(&mut self, at: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("v1.0.0"));
+        let message = cx.new(|cx| InputState::new(window, cx).placeholder("Message (facultatif : sans message, tag léger)"));
+        let (weak, focus) = (cx.weak_entity(), name.clone());
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (name, message, weak) = (name.clone(), message.clone(), weak.clone());
+            let body = div().flex().flex_col().gap_3().child(Input::new(&name)).child(Input::new(&message));
+            ui::with_footer(dialog.title(format!("Nouveau tag sur {}", &at.to_string()[..7])).child(body), "Créer le tag", false, move |window, cx| {
+                let n = name.read(cx).value().trim().to_owned();
+                if n.is_empty() {
+                    return false;
+                }
+                let m = message.read(cx).value().trim().to_owned();
+                let mut args = vec!["tag".into()];
+                if !m.is_empty() {
+                    args.extend(["-a".into(), "-m".into(), m]);
+                }
+                args.extend(["--".into(), n, at.to_string()]);
+                weak.update(cx, |this, cx| this.run(GitJob::owned("Création du tag", args).done("Tag créé"), window, cx)).ok();
+                true
+            })
+        });
+        cx.defer_in(window, move |_, window, cx| focus.update(cx, |s, cx| s.focus(window, cx)));
+    }
+
+    pub fn push_tag(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = &self.proj else { return };
+        let job = GitJob::owned("Push du tag", vec!["push".into(), push_remote(&p.repo), format!("refs/tags/{name}")]);
+        self.run(job.network().done("Tag publié"), window, cx);
+    }
+
+    pub fn delete_tag(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let job = GitJob::owned("Suppression du tag", vec!["tag".into(), "-d".into(), "--".into(), name.clone()]);
+        let msg = "Le tag est supprimé de ce dépôt seulement : s'il a été publié, il reste sur le serveur.".to_owned();
+        self.confirm(format!("Supprimer le tag {name} ?"), msg, "Supprimer", job, window, cx);
+    }
+
+    /// Settles the conflict block starting at line `start` of a conflicted file with the side
+    /// picked. Once no block is left, the file is marked resolved.
+    pub fn resolve_block(&mut self, path: String, start: u32, pick: conflict::Pick, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file) = self.proj.as_ref().and_then(|p| p.repo.workdir()).map(|w| w.join(&path)) else { return };
+        let resolved = std::fs::read(&file).map_err(|e| e.to_string()).and_then(|bytes| {
+            let text = String::from_utf8(bytes).map_err(|_| "le fichier n'est pas du texte UTF-8".to_owned())?;
+            let out = conflict::resolve(&text, start as usize, pick).ok_or("le fichier a changé depuis son affichage")?;
+            std::fs::write(&file, &out).map_err(|e| e.to_string())?;
+            Ok(conflict::has_conflicts(&out))
+        });
+        match resolved {
+            Err(e) => {
+                self.notify_error("Résolution du conflit impossible", e, window, cx);
+                self.refresh_diff(cx);
+            }
+            Ok(true) => self.refresh_diff(cx),
+            Ok(false) => {
+                let job = GitJob::owned("Résolution", vec!["add".into(), "--".into(), git::literal(&path)]).status_only();
+                self.run(job.done("Conflits du fichier résolus"), window, cx);
+            }
+        }
+    }
+
+    /// Settles a whole conflicted file with one side (`theirs`: the incoming one), then marks it
+    /// resolved. A side where the file was deleted deletes it.
+    pub fn resolve_file(&mut self, path: String, theirs: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = &self.proj else { return };
+        let exists = p.repo.index().ok().and_then(|i| {
+            let c = i.conflicts().ok()?.flatten().find(|c| c.our.as_ref().or(c.their.as_ref()).is_some_and(|e| e.path == path.as_bytes()))?;
+            Some(if theirs { c.their.is_some() } else { c.our.is_some() })
+        });
+        let Some(exists) = exists else { return };
+        let spec = git::literal(&path);
+        let job = if exists {
+            let side = if theirs { "--theirs" } else { "--ours" };
+            let add = vec!["add".into(), "--".into(), spec.clone()];
+            GitJob::owned("Résolution", vec!["checkout".into(), side.into(), "--".into(), spec])
+                .after(move |this, window, cx| this.run(GitJob::owned("Résolution", add).status_only().done("Conflit résolu"), window, cx))
+        } else {
+            GitJob::owned("Résolution", vec!["rm".into(), "-q".into(), "--".into(), spec]).done("Conflit résolu : fichier supprimé")
+        };
+        self.run(job.status_only(), window, cx);
     }
 
     /// Stages, unstages or discards the selected lines of the open diff (or one hunk).

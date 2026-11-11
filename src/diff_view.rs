@@ -16,6 +16,7 @@ use gpui_component::{
 };
 
 use crate::app::{LineOp, OpenDiff, Rameau};
+use crate::conflict::{self, Pick};
 use crate::repo::{self, DiffLine, DiffSource, LineKind};
 use crate::theme::{self, alpha, c, mono, pal};
 use crate::ui::{appear, button_sm, icon_button, key};
@@ -212,6 +213,7 @@ impl Rameau {
         // Partly checked file: switch between the part going into the commit and the rest.
         let partial = !matches!(d.source, DiffSource::Commit(_))
             && self.history().is_some_and(|h| h.changes.files.iter().any(|f| f.path == d.path && f.check == repo::Check::Part));
+        let conflicted = d.source == DiffSource::Unstaged && self.history().is_some_and(|h| h.changes.conflicted.contains(&d.path));
         let other = if staged { DiffSource::Unstaged } else { DiffSource::Staged };
         let other_path = d.path.clone();
         let button = |id: &'static str, label: String, op: LineOp, cx: &mut Context<Self>| {
@@ -254,6 +256,15 @@ impl Rameau {
                     .child(layout_button("unified", "Unifié", !split, cx))
                     .child(layout_button("split", "Côte à côte", split, cx)),
             )
+            .when(conflicted, |el| {
+                let whole = |id: &'static str, label: &'static str, theirs: bool, cx: &mut Context<Self>| {
+                    let path = d.path.clone();
+                    button_sm(id).ghost().label(label).tooltip("Tout le fichier prend cette version, et il est marqué résolu").on_click(
+                        cx.listener(move |this, _: &ClickEvent, window, cx| this.resolve_file(path.clone(), theirs, window, cx)),
+                    )
+                };
+                el.child(whole("all-ours", "Tout HEAD", false, cx)).child(whole("all-theirs", "Tout entrant", true, cx))
+            })
             // The hint gives way first when the header gets narrow: the buttons stay.
             .child(div().flex_1().min_w_0().flex().justify_end().when(d.selectable && n == 0, |el| {
                 el.child(div().min_w_0().truncate().text_xs().text_color(c(p.faint)).child("Clique sur des lignes pour les choisir (Maj+clic : plage)"))
@@ -483,7 +494,32 @@ fn diff_line(d: &OpenDiff, ix: usize, cx: &mut Context<Rameau>) -> AnyElement {
                 .hover(|s| s.bg(alpha(p.accent, 0.12)))
                 .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| this.toggle_line(ix, e.modifiers().shift, cx)))
         })
+        .when_some(conflict_start(d, ix), |row, (start, theirs)| {
+            let pick = |id: &'static str, label: String, pick: Pick, cx: &mut Context<Rameau>| {
+                let path = d.path.clone();
+                hunk_button((id, ix)).label(label).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.resolve_block(path.clone(), start, pick, window, cx)))
+            };
+            let ours = conflict::label(&l.text).unwrap_or("HEAD").to_owned();
+            row.child(pick("keep-ours", format!("Garder {}", short_label(&ours)), Pick::Ours, cx))
+                .child(pick("keep-theirs", format!("Garder {}", short_label(&theirs)), Pick::Theirs, cx))
+                .child(pick("keep-both", "Garder les deux".into(), Pick::Both, cx))
+        })
         .into_any_element()
+}
+
+/// The start of a conflict block at diff line `ix`: its line in the file and the incoming side's label.
+fn conflict_start(d: &OpenDiff, ix: usize) -> Option<(u32, String)> {
+    let l = &d.lines[ix];
+    if l.kind != repo::LineKind::Marker || !conflict::is_marker(&l.text, '<') {
+        return None;
+    }
+    let end = d.lines[ix + 1..].iter().find(|l| l.kind == LineKind::Marker && conflict::is_marker(&l.text, '>'))?;
+    Some((l.new?, conflict::label(&end.text).unwrap_or("entrant").to_owned()))
+}
+
+/// A branch name or hash short enough for a button inside a diff line.
+fn short_label(s: &str) -> String {
+    if s.chars().count() <= 24 { s.to_owned() } else { format!("{}…", s.chars().take(23).collect::<String>()) }
 }
 
 #[cfg(test)]

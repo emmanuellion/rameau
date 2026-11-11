@@ -495,10 +495,10 @@ fn conflict_lines(repo: &Repository, path: &str) -> Vec<DiffLine> {
         return vec![info("Fichier en conflit, absent du disque : il a été supprimé d'un côté et modifié de l'autre.")];
     };
     let text = String::from_utf8_lossy(&bytes);
-    let mut lines = vec![info("Garde la bonne version entre les marqueurs dans ton éditeur, enregistre, puis coche le fichier.")];
+    let mut lines = vec![info("Choisis une version pour chaque bloc (boutons sur ses marqueurs), ou corrige le fichier dans ton éditeur puis coche-le.")];
     lines.extend(text.split_inclusive('\n').enumerate().map(|(i, l)| {
         let l = l.trim_end_matches('\n');
-        let marker = ["<<<<<<<", "|||||||", "=======", ">>>>>>>"].iter().any(|m| l.starts_with(m));
+        let marker = ['<', '|', '=', '>'].into_iter().any(|m| crate::conflict::is_marker(l, m));
         DiffLine { kind: if marker { LineKind::Marker } else { LineKind::Context }, old: None, new: Some(i as u32 + 1), text: l.to_owned() }
     }));
     lines

@@ -49,16 +49,19 @@ About half the memory of GitHub Desktop, open in 0.2 s. No Electron.
 | **Amend and undo** | Amend the last commit, or undo it: its changes come back staged, with its message |
 | **Diffs** | Syntax highlighting, word-level changes, unified or side-by-side view, per commit or for local changes |
 | **Branches** | Checkout, merge, rebase, create, delete locally or on the remote (right-click) |
+| **Commits** | Cherry-pick, revert, reset (soft, mixed, hard), create, publish and delete tags (right-click) |
 | **Interactive rebase** | Reorder, reword, squash or drop commits |
 | **Stash** | Stash, apply, delete |
-| **Conflicts** | "Merge/Rebase in progress" banner with Continue / Abort |
+| **Conflicts** | Pick a side for each conflict block (HEAD, incoming, both) or for the whole file, then Continue / Abort from the banner |
 | **GitHub** | Sign in with the device flow, clone one of your repositories from a list, see each branch's pull request and CI result, open a pull request in one click |
-| **Remotes** | Push, pull, fetch |
+| **Remotes** | Push, pull, fetch, automatic fetch every 5 minutes |
 | **Projects** | Open a folder, clone a URL, create a repository, drag and drop; switch between projects |
 | **Comfort** | Light and dark themes, resizable panels, git identity setup, discard changes per file or per line |
 
-Keyboard: <kbd>↑</kbd> <kbd>↓</kbd> browse history, <kbd>Esc</kbd> close the diff,
-<kbd>⌘</kbd>+<kbd>↩</kbd> (<kbd>Ctrl</kbd>+<kbd>↩</kbd> on Linux/Windows) commit.
+Keyboard (<kbd>⌘</kbd> on macOS, <kbd>Ctrl</kbd> on Linux/Windows): <kbd>↑</kbd> <kbd>↓</kbd> browse history or changed files,
+<kbd>Esc</kbd> close the diff, <kbd>⌘</kbd>+<kbd>↩</kbd> commit, <kbd>⌘</kbd>+<kbd>1</kbd> / <kbd>2</kbd> changes / history,
+<kbd>⌘</kbd>+<kbd>F</kbd> search, <kbd>⌘</kbd>+<kbd>P</kbd> push, <kbd>⌘</kbd>+<kbd>⇧</kbd>+<kbd>P</kbd> pull,
+<kbd>⌘</kbd>+<kbd>⇧</kbd>+<kbd>F</kbd> fetch, <kbd>⌘</kbd>+<kbd>R</kbd> or <kbd>F5</kbd> refresh.
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="assets/screenshots/commit-light.png">
