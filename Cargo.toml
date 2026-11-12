@@ -14,6 +14,11 @@ categories = ["development-tools", "gui"]
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0"
 
+# Windows: installer and automatic updates, read from the GitHub releases (packaged by `vpk` in the
+# Release workflow, same version).
+[target.'cfg(windows)'.dependencies]
+velopack = "=1.2.161"
+
 [dependencies]
 # runtime_shaders: compile Metal shaders at launch, so no full Xcode is needed to build
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }

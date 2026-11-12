@@ -22,7 +22,7 @@ use gpui_component::{
 use crate::config::{self, Config};
 use crate::rebase::RebaseEditor;
 use crate::repo::{self, Details, DiffLine, DiffSource, History, LineKind, RefKind};
-use crate::{conflict, diff_view, git, github, patch, theme, ui};
+use crate::{conflict, diff_view, git, github, patch, theme, ui, update};
 
 actions!(rameau, [SelectPrev, SelectNext, CloseDiff, ShowChanges, ShowHistory, FocusSearch, Fetch, Pull, Push, Refresh]);
 
@@ -282,6 +282,13 @@ impl Rameau {
             }
         })
         .detach();
+        // An installed copy (Windows) looks for a newer release once per launch, downloads it in the
+        // background, then offers to restart. Not restarted, it installs at the next launch.
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(ready) = cx.background_executor().spawn(async { update::download() }).await else { return };
+            this.update_in(cx, |this, window, cx| this.update_ready(ready, window, cx)).ok();
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             let account = cx.background_executor().spawn(async { github::load() }).await;
             this.update(cx, |this, cx| {
@@ -381,6 +388,20 @@ impl Rameau {
                 })
             });
         }
+        window.push_notification(n, cx);
+    }
+
+    /// A newer version is downloaded: offer to restart now (else it installs at the next launch).
+    fn update_ready(&self, ready: update::Ready, window: &mut Window, cx: &mut Context<Self>) {
+        let msg = format!("Rameau {} est prêt. Il s'installera au prochain lancement, ou maintenant si tu redémarres.", ready.version());
+        let ready = Rc::new(ready);
+        let n = Notification::info(msg).title("Mise à jour disponible").autohide(false).action(move |_, _, _| {
+            let ready = ready.clone();
+            Button::new("update-restart").primary().small().label("Redémarrer").on_click(move |_, window, cx| {
+                let err = ready.restart();
+                window.push_notification(Notification::error(err).title("Mise à jour impossible"), cx);
+            })
+        });
         window.push_notification(n, cx);
     }
 

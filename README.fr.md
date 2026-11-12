@@ -122,7 +122,10 @@ xattr -dr com.apple.quarantine /Applications/Rameau.app
 
 Installe [Git pour Windows](https://git-scm.com/download/win), puis lance `rameau-setup.exe` : il installe Rameau pour
 ton compte (sans droits administrateur), avec un raccourci dans le menu Démarrer, et se désinstalle depuis
-**Paramètres › Applications**. Version portable : dézippe le `.zip` et lance `rameau.exe`.
+**Paramètres › Applications**. L'app installée se met à jour toute seule : une nouvelle version se télécharge en
+arrière-plan et s'installe au lancement suivant, ou tout de suite avec **Redémarrer**. Si tu as installé la 0.3.0,
+désinstalle-la d'abord : l'installateur a changé.
+Version portable (sans mise à jour automatique) : dézippe le `.zip` et lance `rameau.exe`.
 Si SmartScreen affiche « Windows a protégé votre ordinateur » : **Informations complémentaires › Exécuter quand même**.
 </details>
 
@@ -160,7 +163,8 @@ sudo apt install build-essential pkg-config cmake clang git \
 </details>
 
 Empaqueter à la main : `scripts/package-macos.sh` (`.app` + `.dmg`), `scripts/package-linux.sh`
-(AppImage + `.tar.gz`) et `packaging/windows/rameau.iss` (installateur [Inno Setup](https://jrsoftware.org/isinfo.php)).
+(AppImage + `.tar.gz`) ; sous Windows, [Velopack](https://velopack.io) (`vpk pack`, voir le workflow Release) fait
+l'installateur et les paquets de mise à jour.
 
 <details>
 <summary>Publier une version</summary>

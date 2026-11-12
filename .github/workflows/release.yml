@@ -91,9 +91,15 @@ jobs:
           mkdir -p dist/pkg
           cp target/release/rameau.exe LICENSE README.md dist/pkg/
           pwsh -Command "Compress-Archive -Path dist/pkg/* -DestinationPath dist/rameau-$VERSION-windows-x86_64.zip"
-          # Installer (setup.exe) next to the zip. The script finds the exe in target/release itself.
-          choco install innosetup -y --no-progress
-          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" -Q "-DAppVersion=$VERSION" "-O$(cygpath -w "$PWD/dist")" packaging/windows/rameau.iss
+          # Installer and automatic updates (Velopack, same version as the velopack crate): the setup,
+          # plus the full package and releases.win.json that installed copies read from the release.
+          # shortcut: full packages only (~16 MB per update); download the previous release before
+          # packing (vpk download github) to also publish deltas.
+          dotnet tool install -g vpk --version 1.2.161
+          vpk pack --packId Rameau --packVersion "$VERSION" --packDir dist/pkg --mainExe rameau.exe --runtime win-x64 --packTitle Rameau --packAuthors "Emmanuel Lion" --icon packaging/windows/rameau.ico --outputDir dist/velopack
+          mv dist/velopack/Rameau-win-Setup.exe "dist/rameau-$VERSION-windows-x86_64-setup.exe"
+          # Capital R: the release job's renaming (rameau-<version>-*) leaves the name the feed points to.
+          mv "dist/velopack/Rameau-$VERSION-full.nupkg" dist/velopack/releases.win.json dist/
           test -s "dist/rameau-$VERSION-windows-x86_64-setup.exe"
 
       - uses: actions/upload-artifact@v4
@@ -105,6 +111,8 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*.exe
+            dist/*.nupkg
+            dist/releases.*.json
           if-no-files-found: error
 
   release:

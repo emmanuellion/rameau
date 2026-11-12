@@ -18,7 +18,9 @@
 1. Installe [Git pour Windows](https://git-scm.com/download/win) si ce n'est pas déjà fait.
 2. Lance `rameau-setup.exe` : il installe Rameau pour ton compte (sans droits administrateur), avec un raccourci
    dans le menu Démarrer. Il se désinstalle depuis **Paramètres › Applications**.
-   Version portable : dézippe le `.zip` et lance `rameau.exe`.
+   L'app installée se met à jour toute seule (au lancement suivant, ou tout de suite avec **Redémarrer**).
+   Si tu as installé la 0.3.0, désinstalle-la d'abord : l'installateur a changé.
+   Version portable (sans mise à jour automatique) : dézippe le `.zip` et lance `rameau.exe`.
 3. Windows SmartScreen peut afficher « Windows a protégé votre ordinateur » :
    clique sur **Informations complémentaires › Exécuter quand même**.
 

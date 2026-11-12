@@ -123,7 +123,9 @@ xattr -dr com.apple.quarantine /Applications/Rameau.app
 
 Install [Git for Windows](https://git-scm.com/download/win), then run `rameau-setup.exe`. It installs Rameau for your
 account (no admin rights needed) with a Start menu shortcut, and uninstalls from **Settings › Apps**.
-For the portable version, unzip the `.zip` and run `rameau.exe`.
+The installed app keeps itself up to date: a new version downloads in the background and installs at the
+next launch, or right away with **Restart**. If you installed version 0.3.0, uninstall it first: the installer changed.
+For the portable version (no automatic updates), unzip the `.zip` and run `rameau.exe`.
 If SmartScreen shows "Windows protected your PC", click **More info › Run anyway**.
 </details>
 
@@ -160,8 +162,8 @@ sudo apt install build-essential pkg-config cmake clang git \
 ```
 </details>
 
-Packaging: `scripts/package-macos.sh` (`.app` + `.dmg`), `scripts/package-linux.sh` (AppImage + `.tar.gz`) and
-`packaging/windows/rameau.iss` ([Inno Setup](https://jrsoftware.org/isinfo.php) installer).
+Packaging: `scripts/package-macos.sh` (`.app` + `.dmg`), `scripts/package-linux.sh` (AppImage + `.tar.gz`); on Windows,
+[Velopack](https://velopack.io) (`vpk pack`, see the Release workflow) builds the installer and the update packages.
 Development happens on the `develop` branch. Releases are built by the
 [Release workflow](.github/workflows/release.yml) when a `v*` tag matching `Cargo.toml` is pushed on a commit of `main`.
 

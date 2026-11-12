@@ -14,6 +14,7 @@ mod rebase;
 mod repo;
 mod theme;
 mod ui;
+mod update;
 mod view;
 
 use git2::Repository;
@@ -24,6 +25,8 @@ use app::{CloseDiff, Fetch, FocusSearch, Pull, Push, Rameau, Refresh, SelectNext
 use config::Config;
 
 fn main() {
+    // Before anything else: the Windows setup runs the exe to install or uninstall it.
+    update::startup();
     git::load_shell_path();
     let mut config = Config::load();
     // `rameau <path>` opens (and imports) that project.
