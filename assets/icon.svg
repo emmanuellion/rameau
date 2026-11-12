@@ -1,22 +1,65 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Grid: lanes at x 352 / 512 / 672 (160 apart), 60 stroke, nodes r 58 with a 16 gap cut around
+       them. The root commit sits at the bottom center: the blue trunk leaves it for the left lane, the
+       pink branch goes straight up, the green one forks to the right. Tips 64 apart in height, like a
+       crown: pink highest, then green, then blue. -->
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#252b3b"/>
-      <stop offset="1" stop-color="#12141a"/>
+      <stop offset="0" stop-color="#2a3145"/>
+      <stop offset="1" stop-color="#11131a"/>
     </linearGradient>
+    <!-- Light catching the top edge of the tile. -->
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="0.35" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="512" cy="420" r="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5ab0f6" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#5ab0f6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="blue" x1="0" y1="200" x2="0" y2="800" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#74c2ff"/>
+      <stop offset="1" stop-color="#3f93e8"/>
+    </linearGradient>
+    <linearGradient id="pink" x1="0" y1="200" x2="0" y2="700" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff8fb4"/>
+      <stop offset="1" stop-color="#e2557f"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" y1="200" x2="0" y2="620" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#98eda9"/>
+      <stop offset="1" stop-color="#58c172"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+    <!-- Cuts the lines around each node: a clean gap instead of an outline. -->
+    <mask id="gaps" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+      <rect width="1024" height="1024" fill="#fff"/>
+      <g fill="#000">
+        <circle cx="352" cy="364" r="74"/>
+        <circle cx="512" cy="236" r="74"/>
+        <circle cx="672" cy="300" r="74"/>
+        <circle cx="512" cy="770" r="74"/>
+      </g>
+    </mask>
   </defs>
-  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
-  <!-- Lanes 150 apart (362, 512, 662); each fork leaves its parent from a straight stretch,
-       with the same S-curve. Children first so the parent line covers the joint. -->
-  <g fill="none" stroke-width="54" stroke-linecap="round">
-    <path d="M512 520 C512 450 662 450 662 380" stroke="#7bd88f"/>
-    <path d="M362 700 C362 630 512 630 512 560 V320" stroke="#f0719b"/>
-    <path d="M362 790 V236" stroke="#5ab0f6"/>
+
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)" filter="url(#shadow)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#glow)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="183.5" fill="none" stroke="url(#rim)" stroke-width="3"/>
+
+  <!-- Children first: the parent line covers the joint. -->
+  <g fill="none" stroke-width="60" stroke-linecap="round" mask="url(#gaps)">
+    <path d="M512 560 C512 480 672 500 672 420 V300" stroke="url(#green)"/>
+    <path d="M512 700 V236" stroke="url(#pink)"/>
+    <path d="M512 770 V700 C512 620 352 640 352 560 V364" stroke="url(#blue)"/>
   </g>
-  <g stroke="#12141a" stroke-width="16">
-    <circle cx="362" cy="236" r="54" fill="#5ab0f6"/>
-    <circle cx="362" cy="790" r="54" fill="#5ab0f6"/>
-    <circle cx="512" cy="320" r="54" fill="#f0719b"/>
-    <circle cx="662" cy="380" r="54" fill="#7bd88f"/>
-  </g>
+  <circle cx="352" cy="364" r="58" fill="url(#blue)"/>
+  <circle cx="512" cy="236" r="58" fill="url(#pink)"/>
+  <circle cx="672" cy="300" r="58" fill="url(#green)"/>
+  <circle cx="512" cy="770" r="58" fill="url(#blue)"/>
 </svg>
+
+
+
+
